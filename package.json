@@ -1,0 +1,13 @@
+{
+  "name": "wizmini",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/desktop/src-ui"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @wizmini/desktop-ui",
+    "build": "npm run build --workspace @wizmini/desktop-ui",
+    "check": "npm run check --workspace @wizmini/desktop-ui"
+  }
+}

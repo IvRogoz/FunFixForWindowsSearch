@@ -1,0 +1,12 @@
+[package]
+name = "wizd"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+tokio = { workspace = true }
+wizcore-config = { path = "../wizcore-config" }
+wizcore-index = { path = "../wizcore-index" }
+wizcore-query = { path = "../wizcore-query" }
+wizcore-watch = { path = "../wizcore-watch" }

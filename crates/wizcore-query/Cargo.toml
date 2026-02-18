@@ -1,0 +1,8 @@
+[package]
+name = "wizcore-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+wizcore-index = { path = "../wizcore-index" }

@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/native",
+  "crates/wizcore-config",
+  "crates/wizcore-index",
+  "crates/wizcore-query",
+  "crates/wizcore-shell",
+  "crates/wizcore-watch",
+  "crates/wizd"
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+iced = "0.14"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tracing = "0.1"

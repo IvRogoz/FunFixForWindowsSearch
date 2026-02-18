@@ -1,0 +1,11 @@
+[package]
+name = "wizmini-native"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+iced = { workspace = true, features = ["tokio"] }
+global-hotkey = "0.7"
+tray-icon = "0.21"
+walkdir = "2"
+wizd = { path = "../../crates/wizd" }

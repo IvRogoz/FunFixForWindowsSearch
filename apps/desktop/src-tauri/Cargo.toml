@@ -1,0 +1,15 @@
+[package]
+name = "desktop-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+tauri = { version = "2", features = ["tray-icon"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+wizd = { path = "../../../crates/wizd" }
+wizcore-config = { path = "../../../crates/wizcore-config" }
+
+[build-dependencies]
+tauri-build = { version = "2" }
