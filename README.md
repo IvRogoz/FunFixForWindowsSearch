@@ -65,12 +65,14 @@ cargo run -p wizmini-native
 - `/all` - set scope to all local drives (persistent until changed)
 - `/x:` - set scope to a specific drive (example: `/d:`), persistent until changed
 - `/testProgress` - visual progress bar test only (no indexing)
+- `/exit` - exit the app immediately
 
 Behavior notes:
 
 - Type `/` to open command suggestions.
 - Use `ArrowUp/ArrowDown` to select a command and `Enter` to apply it.
 - If `/` is removed, arrow keys return to normal file-result navigation.
+- `/exit` runs as soon as it is typed.
 
 ## Notes
 
