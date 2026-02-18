@@ -1,15 +1,15 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::time::Duration;
-use std::{env, process::Command};
 use std::time::Instant;
+use std::{env, process::Command};
 use std::{sync::mpsc, thread};
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
-use iced::keyboard::{Event as KeyboardEvent, Key, key};
-use iced::widget::{self, column, container, progress_bar, row, scrollable, text, text_input};
+use iced::keyboard::{key, Event as KeyboardEvent, Key};
 use iced::widget::operation;
+use iced::widget::{self, column, container, progress_bar, row, scrollable, text, text_input};
 use iced::window;
 use iced::{Alignment, Element, Fill, Length, Point, Size, Subscription, Task, Theme};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
@@ -19,6 +19,7 @@ use walkdir::WalkDir;
 const PANEL_WIDTH: f32 = 980.0;
 const PANEL_HEIGHT: f32 = 560.0;
 const MAX_INDEX_FILES: usize = 200_000;
+const PANEL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 
 fn main() -> iced::Result {
     iced::application(
@@ -26,7 +27,7 @@ fn main() -> iced::Result {
             (
                 App::default(),
                 Task::batch(vec![
-                    apply_panel_interaction_mode(false),
+                    initialize_panel_hidden_mode(),
                     Task::done(Message::StartIndex(SearchScope::CurrentFolder)),
                 ]),
             )
@@ -34,11 +35,11 @@ fn main() -> iced::Result {
         update,
         view,
     )
-        .title("WizMini")
-        .theme(theme)
-        .window(native_window_settings())
-        .subscription(subscription)
-        .run()
+    .title("WizMini")
+    .theme(theme)
+    .window(native_window_settings())
+    .subscription(subscription)
+    .run()
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +91,7 @@ struct App {
     last_action: String,
     panel_visible: bool,
     panel_progress: f32,
+    panel_anim_last_tick: Option<Instant>,
     _hotkey_manager: Option<GlobalHotKeyManager>,
     _hotkey: Option<HotKey>,
     _tray_icon: Option<TrayIcon>,
@@ -121,6 +123,7 @@ impl Default for App {
             last_action: "Indexing files...".to_string(),
             panel_visible: false,
             panel_progress: 0.0,
+            panel_anim_last_tick: None,
             _hotkey_manager: hotkey_manager,
             _hotkey: hotkey,
             _tray_icon: tray_icon,
@@ -175,14 +178,35 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::AnimateFrame => {
             let target = if app.panel_visible { 1.0 } else { 0.0 };
-            let step = 0.14;
+
+            let now = Instant::now();
+            let dt = app
+                .panel_anim_last_tick
+                .map(|last| now.saturating_duration_since(last))
+                .unwrap_or(Duration::from_millis(16));
+            app.panel_anim_last_tick = Some(now);
+
+            let step =
+                (dt.as_secs_f32() / PANEL_ANIMATION_DURATION.as_secs_f32()).clamp(0.01, 0.25);
+
             if app.panel_progress < target {
                 app.panel_progress = (app.panel_progress + step).min(1.0);
             } else if app.panel_progress > target {
                 app.panel_progress = (app.panel_progress - step).max(0.0);
             }
 
-            return sync_window_to_progress(app.panel_progress);
+            let move_task = sync_window_to_progress(app.panel_progress);
+
+            let reached_target = (app.panel_progress - target).abs() <= f32::EPSILON;
+            if reached_target {
+                app.panel_anim_last_tick = None;
+
+                if !app.panel_visible {
+                    return Task::batch(vec![move_task, finalize_panel_hidden_mode()]);
+                }
+            }
+
+            return move_task;
         }
         Message::PollExternal => {
             if app.visual_progress_test_active {
@@ -239,7 +263,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
 
             while let Ok(event) = MenuEvent::receiver().try_recv() {
-                if app.menu_toggle_id.as_ref().is_some_and(|id| event.id == *id) {
+                if app
+                    .menu_toggle_id
+                    .as_ref()
+                    .is_some_and(|id| event.id == *id)
+                {
                     toggled = true;
                 }
                 if app.menu_quit_id.as_ref().is_some_and(|id| event.id == *id) {
@@ -256,11 +284,16 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.last_toggle_at = Some(Instant::now());
 
                 app.panel_visible = !app.panel_visible;
+                app.panel_anim_last_tick = None;
                 if app.panel_visible {
                     app.last_action = "Panel shown".to_string();
                 }
 
-                let window_task = apply_panel_interaction_mode(app.panel_visible);
+                let window_task = if app.panel_visible {
+                    prepare_panel_for_show_mode()
+                } else {
+                    Task::none()
+                };
 
                 if app.panel_visible {
                     return Task::batch(vec![
@@ -285,11 +318,13 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 match key.as_ref() {
                     Key::Named(key::Named::Escape) => {
                         app.panel_visible = false;
-                        return apply_panel_interaction_mode(false);
+                        app.panel_anim_last_tick = None;
+                        return Task::none();
                     }
                     Key::Named(key::Named::ArrowDown) => {
                         if command_mode {
-                            app.command_selected = (app.command_selected + 1).min(suggestions.len() - 1);
+                            app.command_selected =
+                                (app.command_selected + 1).min(suggestions.len() - 1);
                         } else if !app.items.is_empty() {
                             app.selected = (app.selected + 1).min(app.items.len() - 1);
                         }
@@ -351,7 +386,11 @@ fn view(app: &App) -> Element<'_, Message> {
     let command_items = command_menu_items(&app.raw_query);
     let mut command_dropdown = column![];
     for (index, item) in command_items.iter().enumerate() {
-        let marker = if index == app.command_selected { ">" } else { " " };
+        let marker = if index == app.command_selected {
+            ">"
+        } else {
+            " "
+        };
         command_dropdown = command_dropdown.push(
             row![
                 text(marker),
@@ -512,12 +551,10 @@ fn index_files_for_scope_with_progress(
 
 fn scope_roots(scope: &SearchScope) -> Vec<String> {
     match scope {
-        SearchScope::CurrentFolder => vec![
-            env::current_dir()
-                .unwrap_or_else(|_| "C:\\".into())
-                .to_string_lossy()
-                .to_string(),
-        ],
+        SearchScope::CurrentFolder => vec![env::current_dir()
+            .unwrap_or_else(|_| "C:\\".into())
+            .to_string_lossy()
+            .to_string()],
         SearchScope::EntireCurrentDrive => {
             let cwd = env::current_dir().unwrap_or_else(|_| "C:\\".into());
             let drive = drive_letter_from_path(&cwd).unwrap_or('C');
@@ -559,12 +596,14 @@ struct ParsedDirective {
     scope_override: Option<SearchScope>,
     clean_query: String,
     test_progress: bool,
+    exit_app: bool,
 }
 
 fn parse_scope_directive(input: &str) -> ParsedDirective {
     let mut scope_override = None;
     let mut remaining = Vec::new();
     let mut test_progress = false;
+    let mut exit_app = false;
 
     for token in input.split_whitespace() {
         let normalized = token.to_ascii_lowercase();
@@ -589,6 +628,11 @@ fn parse_scope_directive(input: &str) -> ParsedDirective {
             continue;
         }
 
+        if normalized == "/exit" {
+            exit_app = true;
+            continue;
+        }
+
         if normalized.starts_with('/') {
             continue;
         }
@@ -600,6 +644,7 @@ fn parse_scope_directive(input: &str) -> ParsedDirective {
         scope_override,
         clean_query: remaining.join(" "),
         test_progress,
+        exit_app,
     }
 }
 
@@ -636,6 +681,10 @@ fn command_menu_items(input: &str) -> Vec<CommandMenuItem> {
         CommandMenuItem {
             command: "/testProgress",
             description: "Visual progress bar test",
+        },
+        CommandMenuItem {
+            command: "/exit",
+            description: "Exit app immediately",
         },
     ];
 
@@ -696,31 +745,51 @@ fn reveal_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_panel_interaction_mode(show: bool) -> Task<Message> {
+fn initialize_panel_hidden_mode() -> Task<Message> {
     window::latest().then(move |maybe_id| {
         if let Some(id) = maybe_id {
             window::monitor_size(id).then(move |monitor| {
                 let monitor = monitor.unwrap_or(Size::new(PANEL_WIDTH, PANEL_HEIGHT));
                 let x = ((monitor.width - PANEL_WIDTH) / 2.0).max(0.0);
-                let y = if show { 0.0 } else { -PANEL_HEIGHT };
+                let y = -PANEL_HEIGHT;
 
-                if show {
-                    Task::batch(vec![
-                        window::move_to(id, Point::new(x, y)),
-                        window::disable_mouse_passthrough(id),
-                        window::gain_focus(id),
-                    ])
-                } else {
-                    Task::batch(vec![
-                        window::move_to(id, Point::new(x, y)),
-                        window::enable_mouse_passthrough(id),
-                    ])
-                }
+                Task::batch(vec![
+                    window::move_to(id, Point::new(x, y)),
+                    window::enable_mouse_passthrough(id),
+                ])
             })
         } else {
             Task::none()
         }
     })
+}
+
+fn prepare_panel_for_show_mode() -> Task<Message> {
+    window::latest().then(move |maybe_id| {
+        if let Some(id) = maybe_id {
+            Task::batch(vec![
+                window::disable_mouse_passthrough(id),
+                window::gain_focus(id),
+            ])
+        } else {
+            Task::none()
+        }
+    })
+}
+
+fn finalize_panel_hidden_mode() -> Task<Message> {
+    window::latest().then(move |maybe_id| {
+        if let Some(id) = maybe_id {
+            window::enable_mouse_passthrough(id)
+        } else {
+            Task::none()
+        }
+    })
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    let clamped = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - clamped).powi(3)
 }
 
 fn sync_window_to_progress(progress: f32) -> Task<Message> {
@@ -729,17 +798,9 @@ fn sync_window_to_progress(progress: f32) -> Task<Message> {
             window::monitor_size(id).then(move |monitor| {
                 let monitor = monitor.unwrap_or(Size::new(PANEL_WIDTH, PANEL_HEIGHT));
                 let x = ((monitor.width - PANEL_WIDTH) / 2.0).max(0.0);
-                let y = -PANEL_HEIGHT * (1.0 - progress.clamp(0.0, 1.0));
+                let y = -PANEL_HEIGHT * (1.0 - ease_out_cubic(progress));
 
-                let mut tasks = vec![window::move_to(id, Point::new(x, y))];
-
-                if progress <= 0.001 {
-                    tasks.push(window::enable_mouse_passthrough(id));
-                } else {
-                    tasks.push(window::disable_mouse_passthrough(id));
-                }
-
-                Task::batch(tasks)
+                window::move_to(id, Point::new(x, y))
             })
         } else {
             Task::none()
@@ -760,6 +821,10 @@ impl App {
             self.indexing_progress = 0.0;
             self.last_action = "Running visual progress test".to_string();
             return Task::none();
+        }
+
+        if parsed.exit_app {
+            return iced::exit();
         }
 
         if let Some(new_scope) = parsed.scope_override {
@@ -846,7 +911,11 @@ fn init_tray() -> Result<(Option<TrayIcon>, Option<MenuId>, Option<MenuId>), Str
         .build()
         .map_err(|e| e.to_string())?;
 
-    Ok((Some(tray), Some(toggle.id().clone()), Some(quit.id().clone())))
+    Ok((
+        Some(tray),
+        Some(toggle.id().clone()),
+        Some(quit.id().clone()),
+    ))
 }
 
 fn build_tray_icon() -> Result<Icon, String> {
