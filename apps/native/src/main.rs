@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::time::Duration;
 use std::{env, process::Command};
 use std::time::Instant;
@@ -5,7 +7,8 @@ use std::time::Instant;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
 use iced::keyboard::{Event as KeyboardEvent, Key, key};
-use iced::widget::{column, container, row, scrollable, text, text_input};
+use iced::widget::{self, column, container, row, scrollable, text, text_input};
+use iced::widget::operation;
 use iced::window;
 use iced::{Alignment, Element, Fill, Length, Point, Size, Subscription, Task, Theme};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
@@ -66,6 +69,7 @@ struct App {
     menu_toggle_id: Option<MenuId>,
     menu_quit_id: Option<MenuId>,
     last_toggle_at: Option<Instant>,
+    search_input_id: widget::Id,
 }
 
 impl Default for App {
@@ -87,6 +91,7 @@ impl Default for App {
             menu_toggle_id,
             menu_quit_id,
             last_toggle_at: None,
+            search_input_id: widget::Id::new("search-input"),
         }
     }
 }
@@ -147,7 +152,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.last_action = "Panel shown".to_string();
                 }
 
-                return apply_panel_interaction_mode(app.panel_visible);
+                let window_task = apply_panel_interaction_mode(app.panel_visible);
+
+                if app.panel_visible {
+                    return Task::batch(vec![
+                        window_task,
+                        operation::focus(app.search_input_id.clone()),
+                        operation::move_cursor_to_end(app.search_input_id.clone()),
+                    ]);
+                }
+
+                return window_task;
             }
         }
         Message::Keyboard(event) => {
@@ -198,6 +213,7 @@ fn view(app: &App) -> Element<'_, Message> {
     let prompt = row![
         text(">"),
         text_input("Type to search files...", &app.query)
+            .id(app.search_input_id.clone())
             .on_input(Message::QueryChanged)
             .on_submit(Message::ActivateSelected)
             .padding(8)
