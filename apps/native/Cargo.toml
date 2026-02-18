@@ -8,4 +8,11 @@ iced = { workspace = true, features = ["tokio"] }
 global-hotkey = "0.7"
 tray-icon = "0.21"
 walkdir = "2"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+] }
 wizd = { path = "../../crates/wizd" }

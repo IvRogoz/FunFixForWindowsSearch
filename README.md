@@ -56,7 +56,7 @@ cargo run -p wizmini-native
 - App runs as a native windowed process with tray icon.
 - Global hotkey default is backtick (`) to show/hide panel.
 - Tray menu supports `Show/Hide` and `Quit`.
-- Search box filters indexed files from the active scope.
+- Search box filters indexed files from the active scope (NTFS volume indexing for drive scopes on Windows; directory walk fallback for non-drive paths).
 - Keyboard controls: `ArrowUp/ArrowDown` select, `Enter` select/open, `Alt+Enter` reveal, `Esc` hide.
 
 ## Slash commands
@@ -76,5 +76,5 @@ Behavior notes:
 
 ## Notes
 
-- This scaffold focuses on architecture and interfaces first.
-- NTFS MFT/USN integrations and real file open/reveal actions are next.
+- NTFS MFT-based volume enumeration is used for drive scopes on Windows.
+- NTFS USN journal replay keeps drive-scope index data updated after initial load.
