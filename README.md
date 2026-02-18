@@ -78,3 +78,4 @@ Behavior notes:
 
 - NTFS MFT-based volume enumeration is used for drive scopes on Windows.
 - NTFS USN journal replay keeps drive-scope index data updated after initial load.
+- Drive-scope NTFS index snapshots + USN checkpoints are persisted under `%LOCALAPPDATA%\WizMini` for faster warm starts and incremental catch-up.

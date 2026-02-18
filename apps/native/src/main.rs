@@ -6,7 +6,9 @@ use std::{env, process::Command};
 use std::{sync::mpsc, thread};
 
 #[cfg(target_os = "windows")]
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+#[cfg(target_os = "windows")]
+use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
 #[cfg(target_os = "windows")]
@@ -85,8 +87,19 @@ struct SearchItem {
 }
 
 enum IndexEvent {
-    Progress { job_id: u64, scanned: usize },
-    Done { job_id: u64, items: Vec<SearchItem> },
+    Progress {
+        job_id: u64,
+        scanned: usize,
+    },
+    Done {
+        job_id: u64,
+        items: Vec<SearchItem>,
+    },
+    Delta {
+        job_id: u64,
+        upserts: Vec<SearchItem>,
+        deleted_paths: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +285,22 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                                     app.scope.label()
                                 );
                                 app.refresh_results();
+                            }
+                        }
+                        IndexEvent::Delta {
+                            job_id,
+                            upserts,
+                            deleted_paths,
+                        } => {
+                            if app.active_index_job == Some(job_id) {
+                                app.apply_index_delta(upserts, deleted_paths);
+                                app.indexing_in_progress = false;
+                                app.indexing_progress = 1.0;
+                                app.last_action = format!(
+                                    "Live index update: {} items [{}]",
+                                    app.all_items.len(),
+                                    app.scope.label()
+                                );
                             }
                         }
                     }
@@ -603,7 +632,7 @@ fn try_index_ntfs_volume(
 }
 
 #[cfg(target_os = "windows")]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct NtfsNode {
     parent_id: u64,
     name: String,
@@ -762,12 +791,35 @@ fn try_index_ntfs_volume(
 
 #[cfg(target_os = "windows")]
 struct NtfsVolumeState {
+    drive_letter: char,
     drive_prefix: String,
     handle: HANDLE,
     journal_id: u64,
     next_usn: i64,
     nodes: HashMap<u64, NtfsNode>,
     path_cache: HashMap<u64, String>,
+    id_to_path: HashMap<u64, String>,
+    last_snapshot_write: Instant,
+    changed_since_snapshot: usize,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Serialize, Deserialize)]
+struct NtfsSnapshot {
+    version: u32,
+    drive_letter: char,
+    journal_id: u64,
+    next_usn: i64,
+    nodes: Vec<NtfsSnapshotNode>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Serialize, Deserialize)]
+struct NtfsSnapshotNode {
+    id: u64,
+    parent_id: u64,
+    name: String,
+    is_dir: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -797,26 +849,59 @@ fn run_ntfs_live_index_job(scope: SearchScope, job_id: u64, tx: &mpsc::Sender<In
         return true;
     }
 
-    loop {
-        let mut changed = false;
-
+    let mut keep_running = true;
+    while keep_running {
         for state in &mut states {
-            if let Some(batch_changed) = poll_ntfs_journal(state) {
-                changed |= batch_changed;
+            match poll_ntfs_journal(state) {
+                Some(batch) => {
+                    persist_usn_checkpoint(state.drive_letter, state.journal_id, state.next_usn);
+
+                    if batch.changed_entries > 0 {
+                        state.changed_since_snapshot += batch.changed_entries;
+                    }
+
+                    maybe_persist_ntfs_snapshot(state);
+
+                    if !batch.upserts.is_empty() || !batch.deleted_paths.is_empty() {
+                        if tx
+                            .send(IndexEvent::Delta {
+                                job_id,
+                                upserts: batch.upserts,
+                                deleted_paths: batch.deleted_paths,
+                            })
+                            .is_err()
+                        {
+                            keep_running = false;
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    if !recover_ntfs_state(state, job_id, tx) {
+                        continue;
+                    }
+
+                    let items = collect_items_from_ntfs_states(
+                        std::slice::from_mut(state),
+                        MAX_INDEX_FILES,
+                    );
+                    if tx.send(IndexEvent::Done { job_id, items }).is_err() {
+                        keep_running = false;
+                        break;
+                    }
+                }
             }
         }
 
-        if changed {
-            let items = collect_items_from_ntfs_states(&mut states, MAX_INDEX_FILES);
-            if tx.send(IndexEvent::Done { job_id, items }).is_err() {
-                break;
-            }
+        if keep_running {
+            thread::sleep(Duration::from_millis(300));
         }
-
-        thread::sleep(Duration::from_millis(300));
     }
 
-    for state in states {
+    for mut state in states {
+        if state.changed_since_snapshot > 0 {
+            persist_ntfs_snapshot(&mut state);
+        }
         let _ = unsafe { CloseHandle(state.handle) };
     }
 
@@ -830,55 +915,49 @@ fn open_ntfs_volume_state(
     tx: &mpsc::Sender<IndexEvent>,
 ) -> Option<NtfsVolumeState> {
     let drive = parse_drive_root_letter(root)?;
-    let volume_path = format!(r"\\.\{}:", drive.to_ascii_uppercase());
-    let volume_wide = to_wide(&volume_path);
+    let (handle, journal) = open_volume_and_query_journal(drive)?;
+    let snapshot = load_ntfs_snapshot(drive);
 
-    let handle = unsafe {
-        CreateFileW(
-            volume_wide.as_ptr(),
-            FILE_GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        )
+    let (nodes, next_usn) = if let Some(snapshot) = snapshot {
+        if snapshot.version == 1
+            && snapshot.journal_id == journal.UsnJournalID
+            && snapshot.next_usn >= journal.FirstUsn
+            && snapshot.next_usn <= journal.NextUsn
+        {
+            (snapshot_nodes_to_map(snapshot.nodes), snapshot.next_usn)
+        } else {
+            let Some(nodes) = enumerate_ntfs_nodes(handle, journal.NextUsn, job_id, tx) else {
+                let _ = unsafe { CloseHandle(handle) };
+                return None;
+            };
+            (nodes, journal.NextUsn)
+        }
+    } else {
+        let Some(nodes) = enumerate_ntfs_nodes(handle, journal.NextUsn, job_id, tx) else {
+            let _ = unsafe { CloseHandle(handle) };
+            return None;
+        };
+        (nodes, journal.NextUsn)
     };
 
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-
-    let mut journal = USN_JOURNAL_DATA_V0::default();
-    let mut bytes_returned = 0u32;
-    let query_ok = unsafe {
-        DeviceIoControl(
-            handle,
-            FSCTL_QUERY_USN_JOURNAL,
-            std::ptr::null_mut(),
-            0,
-            &mut journal as *mut _ as *mut c_void,
-            std::mem::size_of::<USN_JOURNAL_DATA_V0>() as u32,
-            &mut bytes_returned,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if query_ok == 0 {
-        let _ = unsafe { CloseHandle(handle) };
-        return None;
-    }
-
-    let nodes = enumerate_ntfs_nodes(handle, journal.NextUsn, job_id, tx)?;
-
-    Some(NtfsVolumeState {
+    let mut state = NtfsVolumeState {
+        drive_letter: drive,
         drive_prefix: format!("{}:\\", drive.to_ascii_uppercase()),
         handle,
         journal_id: journal.UsnJournalID,
-        next_usn: journal.NextUsn,
+        next_usn,
         nodes,
         path_cache: HashMap::new(),
-    })
+        id_to_path: HashMap::new(),
+        last_snapshot_write: Instant::now(),
+        changed_since_snapshot: 0,
+    };
+
+    initialize_id_path_map(&mut state);
+    persist_usn_checkpoint(drive, state.journal_id, state.next_usn);
+    persist_ntfs_snapshot(&mut state);
+
+    Some(state)
 }
 
 #[cfg(target_os = "windows")]
@@ -964,7 +1043,14 @@ fn enumerate_ntfs_nodes(
 }
 
 #[cfg(target_os = "windows")]
-fn poll_ntfs_journal(state: &mut NtfsVolumeState) -> Option<bool> {
+struct JournalBatch {
+    upserts: Vec<SearchItem>,
+    deleted_paths: Vec<String>,
+    changed_entries: usize,
+}
+
+#[cfg(target_os = "windows")]
+fn poll_ntfs_journal(state: &mut NtfsVolumeState) -> Option<JournalBatch> {
     let mut read_data = READ_USN_JOURNAL_DATA_V0 {
         StartUsn: state.next_usn,
         ReasonMask: u32::MAX,
@@ -993,18 +1079,27 @@ fn poll_ntfs_journal(state: &mut NtfsVolumeState) -> Option<bool> {
     if ok == 0 {
         let err = unsafe { GetLastError() };
         if err == ERROR_HANDLE_EOF {
-            return Some(false);
+            return Some(JournalBatch {
+                upserts: Vec::new(),
+                deleted_paths: Vec::new(),
+                changed_entries: 0,
+            });
         }
         return None;
     }
 
     if out_bytes < 8 {
-        return Some(false);
+        return Some(JournalBatch {
+            upserts: Vec::new(),
+            deleted_paths: Vec::new(),
+            changed_entries: 0,
+        });
     }
 
     state.next_usn = unsafe { *(buffer.as_ptr() as *const i64) };
 
-    let mut changed = false;
+    let mut changed_ids: HashSet<u64> = HashSet::new();
+    let mut deleted_ids: Vec<u64> = Vec::new();
     let mut offset = 8usize;
 
     while offset < out_bytes as usize {
@@ -1019,9 +1114,9 @@ fn poll_ntfs_journal(state: &mut NtfsVolumeState) -> Option<bool> {
             let id = rec.FileReferenceNumber;
 
             if (reason & USN_REASON_FILE_DELETE) != 0 {
-                changed |= remove_ntfs_node_and_descendants(&mut state.nodes, id);
-                if changed {
-                    state.path_cache.clear();
+                let removed_ids = remove_ntfs_node_and_descendants(&mut state.nodes, id);
+                if !removed_ids.is_empty() {
+                    deleted_ids.extend(removed_ids);
                 }
                 offset += record_len;
                 continue;
@@ -1044,11 +1139,11 @@ fn poll_ntfs_journal(state: &mut NtfsVolumeState) -> Option<bool> {
 
                 if needs_update {
                     state.nodes.insert(id, new_node);
-                    changed = true;
+                    changed_ids.insert(id);
                 }
 
                 if (reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME)) != 0 {
-                    changed = true;
+                    changed_ids.insert(id);
                 }
             }
         }
@@ -1056,17 +1151,54 @@ fn poll_ntfs_journal(state: &mut NtfsVolumeState) -> Option<bool> {
         offset += record_len;
     }
 
-    if changed {
+    if !changed_ids.is_empty() || !deleted_ids.is_empty() {
         state.path_cache.clear();
     }
 
-    Some(changed)
+    let mut deleted_paths = Vec::new();
+    for removed_id in deleted_ids {
+        if let Some(path) = state.id_to_path.remove(&removed_id) {
+            deleted_paths.push(path);
+        }
+    }
+
+    let mut upserts = Vec::new();
+    for id in changed_ids {
+        let Some(node) = state.nodes.get(&id) else {
+            continue;
+        };
+
+        if node.is_dir {
+            continue;
+        }
+
+        let path =
+            materialize_full_path(id, &state.nodes, &mut state.path_cache, &state.drive_prefix);
+        if let Some(old_path) = state.id_to_path.insert(id, path.clone()) {
+            if old_path != path {
+                deleted_paths.push(old_path);
+            }
+        }
+
+        upserts.push(SearchItem {
+            name: node.name.clone(),
+            path,
+        });
+    }
+
+    let changed_entries = upserts.len() + deleted_paths.len();
+
+    Some(JournalBatch {
+        upserts,
+        deleted_paths,
+        changed_entries,
+    })
 }
 
 #[cfg(target_os = "windows")]
-fn remove_ntfs_node_and_descendants(nodes: &mut HashMap<u64, NtfsNode>, id: u64) -> bool {
+fn remove_ntfs_node_and_descendants(nodes: &mut HashMap<u64, NtfsNode>, id: u64) -> Vec<u64> {
     if !nodes.contains_key(&id) {
-        return false;
+        return Vec::new();
     }
 
     let mut to_remove = vec![id];
@@ -1082,12 +1214,14 @@ fn remove_ntfs_node_and_descendants(nodes: &mut HashMap<u64, NtfsNode>, id: u64)
         index += 1;
     }
 
-    let mut removed_any = false;
+    let mut removed_ids = Vec::new();
     for target in to_remove {
-        removed_any |= nodes.remove(&target).is_some();
+        if nodes.remove(&target).is_some() {
+            removed_ids.push(target);
+        }
     }
 
-    removed_any
+    removed_ids
 }
 
 #[cfg(target_os = "windows")]
@@ -1118,6 +1252,298 @@ fn collect_items_from_ntfs_states(states: &mut [NtfsVolumeState], limit: usize) 
     }
 
     out
+}
+
+#[cfg(target_os = "windows")]
+fn initialize_id_path_map(state: &mut NtfsVolumeState) {
+    state.id_to_path.clear();
+
+    let ids: Vec<u64> = state
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| (!node.is_dir).then_some(*id))
+        .collect();
+
+    for id in ids {
+        let path =
+            materialize_full_path(id, &state.nodes, &mut state.path_cache, &state.drive_prefix);
+        state.id_to_path.insert(id, path);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn snapshot_nodes_to_map(nodes: Vec<NtfsSnapshotNode>) -> HashMap<u64, NtfsNode> {
+    let mut map = HashMap::with_capacity(nodes.len());
+    for node in nodes {
+        map.insert(
+            node.id,
+            NtfsNode {
+                parent_id: node.parent_id,
+                name: node.name,
+                is_dir: node.is_dir,
+            },
+        );
+    }
+    map
+}
+
+#[cfg(target_os = "windows")]
+fn recover_ntfs_state(
+    state: &mut NtfsVolumeState,
+    job_id: u64,
+    tx: &mpsc::Sender<IndexEvent>,
+) -> bool {
+    let old_handle = state.handle;
+
+    let Some((new_handle, journal)) = open_volume_and_query_journal(state.drive_letter) else {
+        return false;
+    };
+
+    let mut resume_usn = state.next_usn;
+    if let Some(saved) = load_usn_checkpoint(state.drive_letter) {
+        if saved.journal_id == journal.UsnJournalID {
+            resume_usn = resume_usn.max(saved.next_usn);
+        }
+    }
+
+    if resume_usn < journal.FirstUsn {
+        resume_usn = journal.FirstUsn;
+    }
+    if resume_usn > journal.NextUsn {
+        resume_usn = journal.NextUsn;
+    }
+
+    let can_continue = journal.UsnJournalID == state.journal_id
+        && resume_usn >= journal.FirstUsn
+        && resume_usn <= journal.NextUsn;
+
+    if can_continue {
+        state.handle = new_handle;
+        state.next_usn = resume_usn;
+        persist_usn_checkpoint(state.drive_letter, state.journal_id, state.next_usn);
+        let _ = unsafe { CloseHandle(old_handle) };
+        return true;
+    }
+
+    let Some(nodes) = enumerate_ntfs_nodes(new_handle, journal.NextUsn, job_id, tx) else {
+        let _ = unsafe { CloseHandle(new_handle) };
+        return false;
+    };
+
+    state.handle = new_handle;
+    state.journal_id = journal.UsnJournalID;
+    state.next_usn = journal.NextUsn;
+    state.nodes = nodes;
+    state.path_cache.clear();
+    initialize_id_path_map(state);
+    state.changed_since_snapshot = 0;
+    state.last_snapshot_write = Instant::now();
+    persist_usn_checkpoint(state.drive_letter, state.journal_id, state.next_usn);
+    persist_ntfs_snapshot(state);
+
+    let _ = unsafe { CloseHandle(old_handle) };
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn open_volume_and_query_journal(drive: char) -> Option<(HANDLE, USN_JOURNAL_DATA_V0)> {
+    let volume_path = format!(r"\\.\{}:", drive.to_ascii_uppercase());
+    let volume_wide = to_wide(&volume_path);
+
+    let handle = unsafe {
+        CreateFileW(
+            volume_wide.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut journal = USN_JOURNAL_DATA_V0::default();
+    let mut bytes_returned = 0u32;
+    let query_ok = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_QUERY_USN_JOURNAL,
+            std::ptr::null_mut(),
+            0,
+            &mut journal as *mut _ as *mut c_void,
+            std::mem::size_of::<USN_JOURNAL_DATA_V0>() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if query_ok == 0 {
+        let _ = unsafe { CloseHandle(handle) };
+        return None;
+    }
+
+    Some((handle, journal))
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+struct UsnCheckpoint {
+    journal_id: u64,
+    next_usn: i64,
+}
+
+#[cfg(target_os = "windows")]
+fn checkpoint_file_path() -> std::path::PathBuf {
+    let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(base)
+        .join("WizMini")
+        .join("usn_checkpoints.txt")
+}
+
+#[cfg(target_os = "windows")]
+fn load_usn_checkpoint(drive: char) -> Option<UsnCheckpoint> {
+    let path = checkpoint_file_path();
+    let content = std::fs::read_to_string(path).ok()?;
+    let key = drive.to_ascii_uppercase();
+
+    for line in content.lines() {
+        let mut parts = line.split(',');
+        let drive_part = parts.next()?.chars().next()?.to_ascii_uppercase();
+        let journal_id = parts.next()?.parse::<u64>().ok()?;
+        let next_usn = parts.next()?.parse::<i64>().ok()?;
+
+        if drive_part == key {
+            return Some(UsnCheckpoint {
+                journal_id,
+                next_usn,
+            });
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn persist_usn_checkpoint(drive: char, journal_id: u64, next_usn: i64) {
+    let path = checkpoint_file_path();
+    let parent = path.parent();
+    if let Some(dir) = parent {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+
+    let mut map: HashMap<char, UsnCheckpoint> = HashMap::new();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        for line in content.lines() {
+            let mut parts = line.split(',');
+            let Some(drive_part) = parts.next().and_then(|v| v.chars().next()) else {
+                continue;
+            };
+            let Some(journal) = parts.next().and_then(|v| v.parse::<u64>().ok()) else {
+                continue;
+            };
+            let Some(usn) = parts.next().and_then(|v| v.parse::<i64>().ok()) else {
+                continue;
+            };
+            map.insert(
+                drive_part.to_ascii_uppercase(),
+                UsnCheckpoint {
+                    journal_id: journal,
+                    next_usn: usn,
+                },
+            );
+        }
+    }
+
+    map.insert(
+        drive.to_ascii_uppercase(),
+        UsnCheckpoint {
+            journal_id,
+            next_usn,
+        },
+    );
+
+    let mut lines = Vec::new();
+    for (letter, entry) in map {
+        lines.push(format!(
+            "{},{},{}",
+            letter, entry.journal_id, entry.next_usn
+        ));
+    }
+
+    let _ = std::fs::write(path, lines.join("\n"));
+}
+
+#[cfg(target_os = "windows")]
+fn snapshot_file_path(drive: char) -> std::path::PathBuf {
+    let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(base)
+        .join("WizMini")
+        .join("snapshots")
+        .join(format!("{}.json", drive.to_ascii_uppercase()))
+}
+
+#[cfg(target_os = "windows")]
+fn load_ntfs_snapshot(drive: char) -> Option<NtfsSnapshot> {
+    let path = snapshot_file_path(drive);
+    let file = std::fs::File::open(path).ok()?;
+    serde_json::from_reader(file).ok()
+}
+
+#[cfg(target_os = "windows")]
+fn maybe_persist_ntfs_snapshot(state: &mut NtfsVolumeState) {
+    if state.changed_since_snapshot == 0 {
+        return;
+    }
+
+    let elapsed = state.last_snapshot_write.elapsed();
+    let threshold_hit = state.changed_since_snapshot >= 4000;
+    let time_hit = elapsed >= Duration::from_secs(12);
+    if threshold_hit || time_hit {
+        persist_ntfs_snapshot(state);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn persist_ntfs_snapshot(state: &mut NtfsVolumeState) {
+    let path = snapshot_file_path(state.drive_letter);
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+
+    let mut nodes = Vec::with_capacity(state.nodes.len());
+    for (id, node) in &state.nodes {
+        nodes.push(NtfsSnapshotNode {
+            id: *id,
+            parent_id: node.parent_id,
+            name: node.name.clone(),
+            is_dir: node.is_dir,
+        });
+    }
+
+    let snapshot = NtfsSnapshot {
+        version: 1,
+        drive_letter: state.drive_letter,
+        journal_id: state.journal_id,
+        next_usn: state.next_usn,
+        nodes,
+    };
+
+    let Ok(file) = std::fs::File::create(path) else {
+        return;
+    };
+
+    if serde_json::to_writer(file, &snapshot).is_ok() {
+        state.last_snapshot_write = Instant::now();
+        state.changed_since_snapshot = 0;
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1530,6 +1956,28 @@ impl App {
         } else {
             self.selected = self.selected.min(self.items.len() - 1);
         }
+    }
+
+    fn apply_index_delta(&mut self, upserts: Vec<SearchItem>, deleted_paths: Vec<String>) {
+        if !deleted_paths.is_empty() {
+            let delete_set: std::collections::HashSet<String> = deleted_paths.into_iter().collect();
+            self.all_items
+                .retain(|item| !delete_set.contains(&item.path));
+        }
+
+        for upsert in upserts {
+            if let Some(existing) = self
+                .all_items
+                .iter_mut()
+                .find(|item| item.path == upsert.path)
+            {
+                *existing = upsert;
+            } else {
+                self.all_items.push(upsert);
+            }
+        }
+
+        self.refresh_results();
     }
 }
 
