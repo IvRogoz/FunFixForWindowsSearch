@@ -59,6 +59,8 @@ cargo run -p wizmini-native
 - Search box filters indexed files from the active scope (NTFS volume indexing for drive scopes on Windows; directory walk fallback for non-drive paths).
 - Wildcards are supported in search: `*` (any sequence) and `?` (single character), e.g. `sraz*`.
 - Keyboard controls: `ArrowUp/ArrowDown` select, `Enter` select/open, `Alt+Enter` reveal, `Esc` hide.
+- Results list follows keyboard selection scrolling; file names are colorized by type, and long paths are middle-truncated with `...`.
+- Panel width is dynamic (about half the screen width, clamped), and `/exit` is highlighted in bold red in command suggestions.
 
 ## Slash commands
 

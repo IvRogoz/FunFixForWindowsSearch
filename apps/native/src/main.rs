@@ -20,7 +20,7 @@ use iced::keyboard::{key, Event as KeyboardEvent, Key};
 use iced::widget::operation;
 use iced::widget::{self, column, container, progress_bar, row, scrollable, text, text_input};
 use iced::window;
-use iced::{Alignment, Element, Fill, Length, Point, Size, Subscription, Task, Theme};
+use iced::{Alignment, Color, Element, Fill, Font, Length, Point, Size, Subscription, Task, Theme};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use walkdir::WalkDir;
@@ -46,8 +46,12 @@ use windows_sys::Win32::System::IO::DeviceIoControl;
 
 const PANEL_WIDTH: f32 = 980.0;
 const PANEL_HEIGHT: f32 = 560.0;
+const PANEL_WIDTH_RATIO: f32 = 0.5;
 const MAX_INDEX_FILES: usize = 200_000;
 const PANEL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
+const FILE_NAME_FONT_SIZE: u32 = 14;
+const FILE_PATH_FONT_SIZE: u32 = 12;
+const FILE_PATH_MAX_CHARS: usize = 86;
 
 fn main() -> iced::Result {
     iced::application(
@@ -181,6 +185,7 @@ struct App {
     menu_quit_id: Option<MenuId>,
     last_toggle_at: Option<Instant>,
     search_input_id: widget::Id,
+    results_scroll_id: widget::Id,
     scope: SearchScope,
     command_selected: usize,
     index_rx: Option<mpsc::Receiver<IndexEvent>>,
@@ -214,6 +219,7 @@ impl Default for App {
             menu_quit_id,
             last_toggle_at: None,
             search_input_id: widget::Id::new("search-input"),
+            results_scroll_id: widget::Id::new("results-scroll"),
             scope: persisted_scope,
             command_selected: 0,
             index_rx: None,
@@ -426,13 +432,23 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                                 (app.command_selected + 1).min(suggestions.len() - 1);
                         } else if !app.items.is_empty() {
                             app.selected = (app.selected + 1).min(app.items.len() - 1);
+                            return sync_results_scroll(
+                                app.results_scroll_id.clone(),
+                                app.selected,
+                                app.items.len(),
+                            );
                         }
                     }
                     Key::Named(key::Named::ArrowUp) => {
                         if command_mode {
                             app.command_selected = app.command_selected.saturating_sub(1);
-                        } else {
+                        } else if !app.items.is_empty() {
                             app.selected = app.selected.saturating_sub(1);
+                            return sync_results_scroll(
+                                app.results_scroll_id.clone(),
+                                app.selected,
+                                app.items.len(),
+                            );
                         }
                     }
                     Key::Named(key::Named::Enter) if modifiers.alt() && !command_mode => {
@@ -471,11 +487,19 @@ fn view(app: &App) -> Element<'_, Message> {
     let mut listed = column![];
     for (index, item) in app.items.iter().enumerate() {
         let marker = if index == app.selected { ">" } else { " " };
+        let display_path = truncate_middle(&item.path, FILE_PATH_MAX_CHARS);
+        let name_color = file_type_color(&item.name);
         listed = listed.push(
             row![
                 text(marker),
-                text(&item.name).width(Length::Fixed(252.0)),
-                text(&item.path).size(14)
+                text(&item.name)
+                    .color(name_color)
+                    .size(FILE_NAME_FONT_SIZE)
+                    .width(Length::FillPortion(3)),
+                text(display_path)
+                    .color(Color::from_rgb8(145, 150, 160))
+                    .width(Length::FillPortion(5))
+                    .size(FILE_PATH_FONT_SIZE)
             ]
             .spacing(8)
             .padding(6),
@@ -490,14 +514,21 @@ fn view(app: &App) -> Element<'_, Message> {
         } else {
             " "
         };
+
+        let mut command_text = text(item.command).width(Length::Fixed(120.0));
+        if item.command.eq_ignore_ascii_case("/exit") {
+            command_text = command_text
+                .color(Color::from_rgb8(235, 72, 72))
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::DEFAULT
+                });
+        }
+
         command_dropdown = command_dropdown.push(
-            row![
-                text(marker),
-                text(item.command).width(Length::Fixed(120.0)),
-                text(item.description).size(13)
-            ]
-            .spacing(8)
-            .padding(4),
+            row![text(marker), command_text, text(item.description).size(13)]
+                .spacing(8)
+                .padding(4),
         );
     }
 
@@ -542,7 +573,9 @@ fn view(app: &App) -> Element<'_, Message> {
             app.items.len()
         ))
         .size(14),
-        scrollable(listed).height(Length::Fill),
+        scrollable(listed)
+            .id(app.results_scroll_id.clone())
+            .height(Length::Fill),
         text(format!(
             "Enter select/open | Alt+Enter reveal | Esc hide | {}",
             app.last_action
@@ -553,7 +586,7 @@ fn view(app: &App) -> Element<'_, Message> {
     .padding(12);
 
     container(content)
-        .width(Length::Fixed(PANEL_WIDTH))
+        .width(Fill)
         .height(Length::Fixed(PANEL_HEIGHT))
         .style(container::rounded_box)
         .into()
@@ -581,8 +614,8 @@ fn subscription(app: &App) -> Subscription<Message> {
 fn native_window_settings() -> window::Settings {
     let mut settings = window::Settings::default();
     settings.size = Size::new(PANEL_WIDTH, PANEL_HEIGHT);
-    settings.min_size = Some(Size::new(PANEL_WIDTH, 1.0));
-    settings.max_size = Some(Size::new(PANEL_WIDTH, PANEL_HEIGHT));
+    settings.min_size = Some(Size::new(520.0, 1.0));
+    settings.max_size = None;
     settings.position = window::Position::SpecificWith(start_hidden_position);
     settings.resizable = false;
     settings.decorations = false;
@@ -601,8 +634,13 @@ fn native_window_settings() -> window::Settings {
 }
 
 fn start_hidden_position(window: Size, monitor: Size) -> Point {
-    let x = ((monitor.width - window.width) / 2.0).max(0.0);
+    let target_width = panel_width_for_monitor(monitor.width);
+    let x = ((monitor.width - target_width) / 2.0).max(0.0);
     Point::new(x, -window.height)
+}
+
+fn panel_width_for_monitor(monitor_width: f32) -> f32 {
+    (monitor_width * PANEL_WIDTH_RATIO).clamp(640.0, 1800.0)
 }
 
 fn index_files_for_scope_with_progress(
@@ -1868,10 +1906,12 @@ fn initialize_panel_hidden_mode() -> Task<Message> {
         if let Some(id) = maybe_id {
             window::monitor_size(id).then(move |monitor| {
                 let monitor = monitor.unwrap_or(Size::new(PANEL_WIDTH, PANEL_HEIGHT));
-                let x = ((monitor.width - PANEL_WIDTH) / 2.0).max(0.0);
+                let panel_width = panel_width_for_monitor(monitor.width);
+                let x = ((monitor.width - panel_width) / 2.0).max(0.0);
                 let y = -PANEL_HEIGHT;
 
                 Task::batch(vec![
+                    window::resize(id, Size::new(panel_width, PANEL_HEIGHT)),
                     window::move_to(id, Point::new(x, y)),
                     window::enable_mouse_passthrough(id),
                 ])
@@ -1915,10 +1955,14 @@ fn sync_window_to_progress(progress: f32) -> Task<Message> {
         if let Some(id) = maybe_id {
             window::monitor_size(id).then(move |monitor| {
                 let monitor = monitor.unwrap_or(Size::new(PANEL_WIDTH, PANEL_HEIGHT));
-                let x = ((monitor.width - PANEL_WIDTH) / 2.0).max(0.0);
+                let panel_width = panel_width_for_monitor(monitor.width);
+                let x = ((monitor.width - panel_width) / 2.0).max(0.0);
                 let y = -PANEL_HEIGHT * (1.0 - ease_out_cubic(progress));
 
-                window::move_to(id, Point::new(x, y))
+                Task::batch(vec![
+                    window::resize(id, Size::new(panel_width, PANEL_HEIGHT)),
+                    window::move_to(id, Point::new(x, y)),
+                ])
             })
         } else {
             Task::none()
@@ -2034,6 +2078,47 @@ fn query_matches_item(query: &str, item: &SearchItem) -> bool {
     }
 }
 
+fn truncate_middle(input: &str, max_chars: usize) -> String {
+    let len = input.chars().count();
+    if len <= max_chars {
+        return input.to_string();
+    }
+
+    if max_chars <= 3 {
+        return "...".to_string();
+    }
+
+    let left = (max_chars - 3) / 2;
+    let right = max_chars - 3 - left;
+    let start: String = input.chars().take(left).collect();
+    let mut end_chars: Vec<char> = input.chars().rev().take(right).collect();
+    end_chars.reverse();
+    let end: String = end_chars.into_iter().collect();
+    format!("{}...{}", start, end)
+}
+
+fn file_type_color(name: &str) -> Color {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "rs" | "toml" | "json" | "yaml" | "yml" | "xml" | "ini" | "md" | "txt" => {
+            Color::from_rgb8(110, 198, 255)
+        }
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" => {
+            Color::from_rgb8(136, 209, 141)
+        }
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" => Color::from_rgb8(244, 183, 109),
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" => Color::from_rgb8(202, 166, 255),
+        "zip" | "7z" | "rar" | "tar" | "gz" => Color::from_rgb8(220, 158, 116),
+        "exe" | "msi" | "bat" | "cmd" | "ps1" => Color::from_rgb8(255, 128, 128),
+        _ => Color::from_rgb8(220, 224, 230),
+    }
+}
+
 fn wildcard_match(pattern: &str, text: &str) -> bool {
     let p = pattern.as_bytes();
     let t = text.as_bytes();
@@ -2064,6 +2149,15 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     }
 
     pi == p.len()
+}
+
+fn sync_results_scroll(scroll_id: widget::Id, selected: usize, total: usize) -> Task<Message> {
+    if total <= 1 {
+        return Task::none();
+    }
+
+    let y = (selected as f32 / (total.saturating_sub(1)) as f32).clamp(0.0, 1.0);
+    operation::snap_to(scroll_id, widget::scrollable::RelativeOffset { x: 0.0, y })
 }
 
 fn run_index_job(scope: SearchScope, job_id: u64, tx: mpsc::Sender<IndexEvent>) {
