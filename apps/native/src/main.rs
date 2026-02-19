@@ -52,11 +52,14 @@ const PANEL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 fn main() -> iced::Result {
     iced::application(
         || {
+            let app = App::default();
+            let initial_scope = app.scope.clone();
+
             (
-                App::default(),
+                app,
                 Task::batch(vec![
                     initialize_panel_hidden_mode(),
-                    Task::done(Message::StartIndex(SearchScope::CurrentFolder)),
+                    Task::done(Message::StartIndex(initial_scope)),
                 ]),
             )
         },
@@ -121,6 +124,46 @@ impl SearchScope {
     }
 }
 
+fn load_persisted_scope() -> SearchScope {
+    let Ok(content) = std::fs::read_to_string(scope_config_path()) else {
+        return SearchScope::CurrentFolder;
+    };
+
+    let value = content.trim().to_ascii_lowercase();
+    if value == "current-folder" {
+        SearchScope::CurrentFolder
+    } else if value == "entire-current-drive" {
+        SearchScope::EntireCurrentDrive
+    } else if value == "all-local-drives" {
+        SearchScope::AllLocalDrives
+    } else {
+        let bytes = value.as_bytes();
+        if bytes.len() == 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+            SearchScope::Drive((bytes[0] as char).to_ascii_uppercase())
+        } else {
+            SearchScope::CurrentFolder
+        }
+    }
+}
+
+fn persist_scope(scope: &SearchScope) {
+    let path = scope_config_path();
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+
+    let _ = std::fs::write(path, scope.label());
+}
+
+fn scope_config_path() -> std::path::PathBuf {
+    let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(base)
+        .join("WizMini")
+        .join("scope.txt")
+}
+
 struct App {
     raw_query: String,
     query: String,
@@ -152,6 +195,7 @@ impl Default for App {
     fn default() -> Self {
         let (tray_icon, menu_toggle_id, menu_quit_id) = init_tray().unwrap_or((None, None, None));
         let (hotkey_manager, hotkey) = init_hotkey().unwrap_or((None, None));
+        let persisted_scope = load_persisted_scope();
 
         Self {
             raw_query: String::new(),
@@ -170,7 +214,7 @@ impl Default for App {
             menu_quit_id,
             last_toggle_at: None,
             search_input_id: widget::Id::new("search-input"),
-            scope: SearchScope::CurrentFolder,
+            scope: persisted_scope,
             command_selected: 0,
             index_rx: None,
             index_job_counter: 0,
@@ -1921,6 +1965,7 @@ impl App {
         let job_id = self.index_job_counter;
         self.active_index_job = Some(job_id);
         self.scope = scope.clone();
+        persist_scope(&self.scope);
         self.visual_progress_test_active = false;
         self.indexing_in_progress = true;
         self.indexing_progress = 0.0;
@@ -1942,10 +1987,7 @@ impl App {
             self.items = self
                 .all_items
                 .iter()
-                .filter(|item| {
-                    item.name.to_ascii_lowercase().contains(&q)
-                        || item.path.to_ascii_lowercase().contains(&q)
-                })
+                .filter(|item| query_matches_item(&q, item))
                 .take(600)
                 .cloned()
                 .collect();
@@ -1979,6 +2021,49 @@ impl App {
 
         self.refresh_results();
     }
+}
+
+fn query_matches_item(query: &str, item: &SearchItem) -> bool {
+    if query.contains('*') || query.contains('?') {
+        let name = item.name.to_ascii_lowercase();
+        let path = item.path.to_ascii_lowercase();
+        wildcard_match(query, &name) || wildcard_match(query, &path)
+    } else {
+        item.name.to_ascii_lowercase().contains(query)
+            || item.path.to_ascii_lowercase().contains(query)
+    }
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_idx: Option<usize> = None;
+    let mut match_idx = 0usize;
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == t[ti] || p[pi] == b'?') {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_idx = Some(pi);
+            match_idx = ti;
+            pi += 1;
+        } else if let Some(star) = star_idx {
+            pi = star + 1;
+            match_idx += 1;
+            ti = match_idx;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == p.len()
 }
 
 fn run_index_job(scope: SearchScope, job_id: u64, tx: mpsc::Sender<IndexEvent>) {

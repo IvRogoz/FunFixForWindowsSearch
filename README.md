@@ -57,13 +57,14 @@ cargo run -p wizmini-native
 - Global hotkey default is backtick (`) to show/hide panel.
 - Tray menu supports `Show/Hide` and `Quit`.
 - Search box filters indexed files from the active scope (NTFS volume indexing for drive scopes on Windows; directory walk fallback for non-drive paths).
+- Wildcards are supported in search: `*` (any sequence) and `?` (single character), e.g. `sraz*`.
 - Keyboard controls: `ArrowUp/ArrowDown` select, `Enter` select/open, `Alt+Enter` reveal, `Esc` hide.
 
 ## Slash commands
 
-- `/entire` - set scope to the entire current drive (persistent until changed)
-- `/all` - set scope to all local drives (persistent until changed)
-- `/x:` - set scope to a specific drive (example: `/d:`), persistent until changed
+- `/entire` - set scope to the entire current drive (persists across restarts)
+- `/all` - set scope to all local drives (persists across restarts)
+- `/x:` - set scope to a specific drive (example: `/d:`), persists across restarts
 - `/testProgress` - visual progress bar test only (no indexing)
 - `/exit` - exit the app immediately
 
