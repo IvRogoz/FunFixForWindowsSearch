@@ -1,14 +1,18 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod commands;
+mod search;
+
+use std::collections::HashMap;
 use std::time::Duration;
 use std::time::Instant;
 use std::{env, process::Command};
+use std::{io::Write, sync::OnceLock};
 use std::{sync::mpsc, thread};
 
-#[cfg(target_os = "windows")]
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
 #[cfg(target_os = "windows")]
@@ -16,14 +20,26 @@ use std::os::windows::ffi::OsStrExt;
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+use iced::alignment::Horizontal;
 use iced::keyboard::{key, Event as KeyboardEvent, Key};
 use iced::widget::operation;
-use iced::widget::{self, column, container, progress_bar, row, scrollable, text, text_input};
+use iced::widget::{
+    self, column, container, progress_bar, row, scrollable, stack, text, text_input,
+};
 use iced::window;
 use iced::{Alignment, Color, Element, Fill, Font, Length, Point, Size, Subscription, Task, Theme};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use walkdir::WalkDir;
+
+use commands::{
+    apply_command_choice, command_menu_items, format_latest_window, is_exact_directive_token,
+    parse_scope_directive, scope_arg_value,
+};
+use search::{
+    contains_ascii_case_insensitive, file_name_from_path, file_type_color, query_matches_item,
+    truncate_middle,
+};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{
@@ -43,29 +59,64 @@ use windows_sys::Win32::System::Ioctl::{
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::IO::DeviceIoControl;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWDEFAULT;
 
 const PANEL_WIDTH: f32 = 980.0;
 const PANEL_HEIGHT: f32 = 560.0;
 const PANEL_WIDTH_RATIO: f32 = 0.5;
-const MAX_INDEX_FILES: usize = 200_000;
+const VISIBLE_RESULTS_LIMIT: usize = 600;
+const QUERY_DEBOUNCE_DELAY: Duration = Duration::from_millis(140);
+const SEARCH_BATCH_SIZE: usize = 40_000;
+const SEARCH_TIME_BUDGET_PER_TICK: Duration = Duration::from_millis(22);
+const FILENAME_INDEX_BUILD_BATCH: usize = 20_000;
+const DEFAULT_LATEST_WINDOW_SECS: i64 = 5 * 60;
+const DELTA_REFRESH_COOLDOWN: Duration = Duration::from_millis(300);
 const PANEL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const FILE_NAME_FONT_SIZE: u32 = 14;
 const FILE_PATH_FONT_SIZE: u32 = 12;
 const FILE_PATH_MAX_CHARS: usize = 86;
+const MAX_INDEX_EVENTS_PER_TICK: usize = 16;
+const POLL_INTERVAL: Duration = Duration::from_millis(16);
+const UNKNOWN_TS: i64 = i64::MIN;
+
+static DEBUG_LOG_FILES: OnceLock<std::sync::Mutex<Vec<std::fs::File>>> = OnceLock::new();
+static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn main() -> iced::Result {
+    let _ = DEBUG_ENABLED.set(env::var("WIZMINI_DEBUG").ok().as_deref() == Some("1"));
+    let _ = init_debug_log_file();
+    std::panic::set_hook(Box::new(|info| {
+        debug_log(&format!("panic: {}", info));
+    }));
+
+    let start_visible = should_start_visible_from_args();
+
     iced::application(
-        || {
+        move || {
             let app = App::default();
             let initial_scope = app.scope.clone();
 
-            (
-                app,
-                Task::batch(vec![
-                    initialize_panel_hidden_mode(),
-                    Task::done(Message::StartIndex(initial_scope)),
-                ]),
-            )
+            let mut tasks = vec![Task::done(Message::StartIndex(initial_scope))];
+
+            if start_visible {
+                tasks.push(prepare_panel_for_show_mode());
+                tasks.push(sync_window_to_progress(1.0));
+                tasks.push(operation::focus(app.search_input_id.clone()));
+                tasks.push(operation::move_cursor_to_end(app.search_input_id.clone()));
+            } else {
+                tasks.push(initialize_panel_hidden_mode());
+            }
+
+            let mut app = app;
+            if start_visible {
+                app.panel_visible = true;
+                app.panel_progress = 1.0;
+            }
+
+            (app, Task::batch(tasks))
         },
         update,
         view,
@@ -75,6 +126,83 @@ fn main() -> iced::Result {
     .window(native_window_settings())
     .subscription(subscription)
     .run()
+}
+
+fn should_start_visible_from_args() -> bool {
+    env::args().any(|arg| arg == "--show")
+}
+
+fn startup_scope_override_from_args() -> Option<SearchScope> {
+    for arg in env::args() {
+        let Some(value) = arg.strip_prefix("--scope=") else {
+            continue;
+        };
+
+        let lower = value.trim().to_ascii_lowercase();
+        if lower == "current-folder" {
+            return Some(SearchScope::CurrentFolder);
+        }
+        if lower == "entire-current-drive" {
+            return Some(SearchScope::EntireCurrentDrive);
+        }
+        if lower == "all-local-drives" {
+            return Some(SearchScope::AllLocalDrives);
+        }
+
+        let bytes = lower.as_bytes();
+        if bytes.len() == 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+            return Some(SearchScope::Drive((bytes[0] as char).to_ascii_uppercase()));
+        }
+    }
+
+    None
+}
+
+fn debug_log_path_localappdata() -> std::path::PathBuf {
+    let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(base)
+        .join("WizMini")
+        .join("wizmini-debug.log")
+}
+
+fn debug_log_path_exe_dir() -> std::path::PathBuf {
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|v| v.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    exe_dir.join("wizmini-debug.log")
+}
+
+fn init_debug_log_file() -> Result<(), String> {
+    let mut files = Vec::new();
+    let mut opened_paths = Vec::new();
+
+    for path in [debug_log_path_localappdata(), debug_log_path_exe_dir()] {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+        {
+            files.push(file);
+            opened_paths.push(path.display().to_string());
+        }
+    }
+
+    if files.is_empty() {
+        return Err("failed to open any debug log file".to_string());
+    }
+
+    let _ = DEBUG_LOG_FILES.set(std::sync::Mutex::new(files));
+    debug_log(&format!(
+        "log files initialized at {}",
+        opened_paths.join(" | ")
+    ));
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -89,18 +217,34 @@ enum Message {
 
 #[derive(Debug, Clone)]
 struct SearchItem {
-    name: String,
+    path: Box<str>,
+    modified_unix_secs: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ScopeIndexSnapshot {
+    version: u32,
+    scope: String,
+    items: Vec<SnapshotItem>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotItem {
     path: String,
+    modified_unix_secs: i64,
 }
 
 enum IndexEvent {
     Progress {
         job_id: u64,
-        scanned: usize,
+        current: usize,
+        total: usize,
+        phase: &'static str,
     },
     Done {
         job_id: u64,
         items: Vec<SearchItem>,
+        backend: IndexBackend,
     },
     Delta {
         job_id: u64,
@@ -115,6 +259,49 @@ enum SearchScope {
     EntireCurrentDrive,
     AllLocalDrives,
     Drive(char),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexBackend {
+    Detecting,
+    WalkDir,
+    NtfsMft,
+    NtfsUsnLive,
+    Mixed,
+}
+
+impl IndexBackend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Detecting => "detecting",
+            Self::WalkDir => "dirwalk",
+            Self::NtfsMft => "ntfs-mft",
+            Self::NtfsUsnLive => "ntfs-usn-live",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    fn live_updates(self) -> bool {
+        matches!(self, Self::NtfsUsnLive)
+    }
+}
+
+fn backend_status_color(backend: IndexBackend) -> Color {
+    match backend {
+        IndexBackend::NtfsUsnLive => Color::from_rgb8(117, 227, 140),
+        IndexBackend::NtfsMft => Color::from_rgb8(130, 210, 255),
+        IndexBackend::Mixed => Color::from_rgb8(255, 198, 92),
+        IndexBackend::WalkDir => Color::from_rgb8(184, 184, 184),
+        IndexBackend::Detecting => Color::from_rgb8(170, 170, 170),
+    }
+}
+
+fn state_status_color(indexing_in_progress: bool) -> Color {
+    if indexing_in_progress {
+        Color::from_rgb8(255, 184, 76)
+    } else {
+        Color::from_rgb8(117, 227, 140)
+    }
 }
 
 impl SearchScope {
@@ -168,6 +355,63 @@ fn scope_config_path() -> std::path::PathBuf {
         .join("scope.txt")
 }
 
+fn scope_snapshot_path(scope: &SearchScope) -> std::path::PathBuf {
+    let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(base)
+        .join("WizMini")
+        .join("snapshots")
+        .join(format!("scope-{}.bin", scope.label()))
+}
+
+fn load_scope_snapshot(scope: &SearchScope) -> Option<Vec<SearchItem>> {
+    if let Ok(file) = std::fs::File::open(scope_snapshot_path(scope)) {
+        if let Ok(snapshot) = bincode::deserialize_from::<_, ScopeIndexSnapshot>(file) {
+            if snapshot.version == 1 && snapshot.scope == scope.label() {
+                return Some(
+                    snapshot
+                        .items
+                        .into_iter()
+                        .map(|item| SearchItem {
+                            path: item.path.into_boxed_str(),
+                            modified_unix_secs: item.modified_unix_secs,
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    None
+}
+
+fn persist_scope_snapshot_async(scope: SearchScope, items: Vec<SearchItem>) {
+    thread::spawn(move || {
+        let path = scope_snapshot_path(&scope);
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+
+        let snapshot = ScopeIndexSnapshot {
+            version: 1,
+            scope: scope.label(),
+            items: items
+                .into_iter()
+                .map(|item| SnapshotItem {
+                    path: item.path.into_string(),
+                    modified_unix_secs: item.modified_unix_secs,
+                })
+                .collect(),
+        };
+
+        let Ok(file) = std::fs::File::create(path) else {
+            return;
+        };
+        let _ = bincode::serialize_into(file, &snapshot);
+    });
+}
+
 struct App {
     raw_query: String,
     query: String,
@@ -193,16 +437,62 @@ struct App {
     active_index_job: Option<u64>,
     indexing_in_progress: bool,
     indexing_progress: f32,
+    indexing_phase: &'static str,
+    index_backend: IndexBackend,
+    index_memory_bytes: usize,
     visual_progress_test_active: bool,
+    is_elevated: bool,
+    use_dirwalk_fallback: bool,
+    show_privilege_overlay: bool,
+    pending_query: Option<(String, Instant, u64)>,
+    query_edit_counter: u64,
+    active_search_query: Option<String>,
+    active_search_cursor: usize,
+    active_search_results: Vec<SearchItem>,
+    filename_exact_index: HashMap<String, Vec<usize>>,
+    filename_prefix_index: HashMap<String, Vec<usize>>,
+    filename_index_dirty: bool,
+    filename_index_building: bool,
+    filename_index_build_cursor: usize,
+    needs_search_refresh: bool,
+    next_search_refresh_at: Instant,
+    latest_only_mode: bool,
+    latest_window_secs: i64,
+    tracking_enabled: bool,
+    recent_event_by_path: HashMap<Box<str>, i64>,
+    changes_added_since_index: usize,
+    changes_updated_since_index: usize,
+    changes_deleted_since_index: usize,
+    hotkey_retry_after: Option<Instant>,
+    skip_scope_persist_once: bool,
 }
 
 impl Default for App {
     fn default() -> Self {
         let (tray_icon, menu_toggle_id, menu_quit_id) = init_tray().unwrap_or((None, None, None));
-        let (hotkey_manager, hotkey) = init_hotkey().unwrap_or((None, None));
+        let (hotkey_manager, hotkey, hotkey_retry_after) = match init_hotkey() {
+            Ok((manager, hotkey)) => (manager, hotkey, None),
+            Err(err) => {
+                debug_log(&format!("init_hotkey failed: {}", err));
+                (
+                    None,
+                    None,
+                    Some(Instant::now() + Duration::from_millis(1200)),
+                )
+            }
+        };
         let persisted_scope = load_persisted_scope();
+        let is_elevated = is_process_elevated();
+        let arg_scope_override = startup_scope_override_from_args();
+        let startup_scope = if let Some(scope) = arg_scope_override.clone() {
+            scope
+        } else if is_elevated {
+            persisted_scope
+        } else {
+            SearchScope::CurrentFolder
+        };
 
-        Self {
+        let mut app = Self {
             raw_query: String::new(),
             query: String::new(),
             all_items: Vec::new(),
@@ -220,39 +510,112 @@ impl Default for App {
             last_toggle_at: None,
             search_input_id: widget::Id::new("search-input"),
             results_scroll_id: widget::Id::new("results-scroll"),
-            scope: persisted_scope,
+            scope: startup_scope,
             command_selected: 0,
             index_rx: None,
             index_job_counter: 0,
             active_index_job: None,
             indexing_in_progress: false,
             indexing_progress: 0.0,
+            indexing_phase: "index",
+            index_backend: IndexBackend::Detecting,
+            index_memory_bytes: 0,
             visual_progress_test_active: false,
-        }
+            is_elevated,
+            use_dirwalk_fallback: !is_elevated,
+            show_privilege_overlay: !is_elevated,
+            pending_query: None,
+            query_edit_counter: 0,
+            active_search_query: None,
+            active_search_cursor: 0,
+            active_search_results: Vec::new(),
+            filename_exact_index: HashMap::new(),
+            filename_prefix_index: HashMap::new(),
+            filename_index_dirty: true,
+            filename_index_building: false,
+            filename_index_build_cursor: 0,
+            needs_search_refresh: false,
+            next_search_refresh_at: Instant::now(),
+            latest_only_mode: false,
+            latest_window_secs: DEFAULT_LATEST_WINDOW_SECS,
+            tracking_enabled: true,
+            recent_event_by_path: HashMap::new(),
+            changes_added_since_index: 0,
+            changes_updated_since_index: 0,
+            changes_deleted_since_index: 0,
+            hotkey_retry_after,
+            skip_scope_persist_once: !is_elevated && arg_scope_override.is_none(),
+        };
+
+        app.try_restore_scope_snapshot();
+        app
     }
 }
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::QueryChanged(query) => {
-            let task = app.apply_raw_query(query);
+            if app.show_privilege_overlay {
+                app.show_privilege_overlay = false;
+            }
 
-            let suggestions = command_menu_items(&app.raw_query);
+            app.raw_query = query;
+            app.query_edit_counter = app.query_edit_counter.wrapping_add(1);
+            app.active_search_query = None;
+            app.active_search_cursor = 0;
+            app.active_search_results.clear();
+            app.needs_search_refresh = false;
+            app.pending_query = Some((
+                app.raw_query.clone(),
+                Instant::now() + QUERY_DEBOUNCE_DELAY,
+                app.query_edit_counter,
+            ));
+
+            let suggestions = command_menu_items(&app.raw_query, app.tracking_enabled);
             if suggestions.is_empty() {
                 app.command_selected = 0;
             } else {
                 app.command_selected = app.command_selected.min(suggestions.len() - 1);
             }
 
-            return task;
+            return Task::none();
         }
         Message::ActivateSelected => {
-            let suggestions = command_menu_items(&app.raw_query);
+            let suggestions = command_menu_items(&app.raw_query, app.tracking_enabled);
+            let first_token = app
+                .raw_query
+                .trim_start()
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+
+            debug_log(&format!(
+                "ActivateSelected raw='{}' token='{}' suggestions={} selected={} items={}",
+                app.raw_query,
+                first_token,
+                suggestions.len(),
+                app.command_selected,
+                app.items.len()
+            ));
+
+            if is_exact_directive_token(first_token, app.tracking_enabled) {
+                debug_log("ActivateSelected executing exact directive token");
+                let task = app.apply_raw_query(app.raw_query.clone(), true);
+                return Task::batch(vec![
+                    task,
+                    operation::focus(app.search_input_id.clone()),
+                    operation::move_cursor_to_end(app.search_input_id.clone()),
+                ]);
+            }
 
             if !suggestions.is_empty() {
                 if let Some(choice) = suggestions.get(app.command_selected) {
+                    debug_log(&format!(
+                        "ActivateSelected applying suggestion command='{}'",
+                        choice.command
+                    ));
                     let new_raw = apply_command_choice(&app.raw_query, choice.command);
-                    let task = app.apply_raw_query(new_raw);
+                    let task = app.apply_raw_query(new_raw, true);
 
                     return Task::batch(vec![
                         task,
@@ -260,9 +623,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         operation::move_cursor_to_end(app.search_input_id.clone()),
                     ]);
                 }
+            } else if app.raw_query.trim_start().starts_with('/') {
+                app.last_action = format!("Unknown command: {}", first_token);
             } else if let Some(item) = app.items.get(app.selected) {
                 app.last_action = format!("Open: {}", item.path);
-                let _ = open_path(&item.path);
+                let _ = open_path(item.path.as_ref());
             }
         }
         Message::AnimateFrame => {
@@ -309,32 +674,128 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 }
             }
 
+            if let Some((pending_query, due_at, edit_id)) = app.pending_query.clone() {
+                if Instant::now() >= due_at && edit_id == app.query_edit_counter {
+                    app.pending_query = None;
+                    let _ = app.apply_raw_query(pending_query, false);
+                }
+            }
+
+            if app.pending_query.is_some() {
+                app.active_search_query = None;
+                app.active_search_cursor = 0;
+                app.active_search_results.clear();
+                return Task::none();
+            }
+
+            if app.needs_search_refresh
+                && app.pending_query.is_none()
+                && Instant::now() >= app.next_search_refresh_at
+            {
+                app.needs_search_refresh = false;
+                app.next_search_refresh_at = Instant::now() + DELTA_REFRESH_COOLDOWN;
+                app.schedule_search_from_current_query();
+            }
+
+            if app.pending_query.is_none() {
+                app.process_filename_index_build_step();
+
+                let search_start = Instant::now();
+                while app.active_search_query.is_some()
+                    && search_start.elapsed() < SEARCH_TIME_BUDGET_PER_TICK
+                {
+                    app.process_search_step();
+                }
+            }
+
             if let Some(rx) = &app.index_rx {
                 let mut pending = Vec::new();
-                while let Ok(event) = rx.try_recv() {
-                    pending.push(event);
+                for _ in 0..MAX_INDEX_EVENTS_PER_TICK {
+                    match rx.try_recv() {
+                        Ok(event) => pending.push(event),
+                        Err(_) => break,
+                    }
+                }
+
+                if !pending.is_empty() {
+                    debug_log(&format!(
+                        "PollExternal received {} index events",
+                        pending.len()
+                    ));
                 }
 
                 for event in pending {
                     match event {
-                        IndexEvent::Progress { job_id, scanned } => {
+                        IndexEvent::Progress {
+                            job_id,
+                            current,
+                            total,
+                            phase,
+                        } => {
                             if app.active_index_job == Some(job_id) {
+                                debug_log(&format!(
+                                    "IndexEvent::Progress accepted job_id={} phase={} current={} total={} active_job={:?}",
+                                    job_id, phase, current, total, app.active_index_job
+                                ));
                                 app.indexing_in_progress = true;
-                                app.indexing_progress =
-                                    (scanned as f32 / MAX_INDEX_FILES as f32).min(0.99);
+                                app.indexing_phase = phase;
+                                app.indexing_progress = if total == 0 {
+                                    0.0
+                                } else {
+                                    (current as f32 / total as f32).clamp(0.0, 1.0)
+                                };
+                            } else {
+                                debug_log(&format!(
+                                    "IndexEvent::Progress ignored job_id={} phase={} current={} total={} active_job={:?}",
+                                    job_id, phase, current, total, app.active_index_job
+                                ));
                             }
                         }
-                        IndexEvent::Done { job_id, items } => {
+                        IndexEvent::Done {
+                            job_id,
+                            items,
+                            backend,
+                        } => {
                             if app.active_index_job == Some(job_id) {
                                 app.indexing_in_progress = false;
                                 app.indexing_progress = 1.0;
+                                app.indexing_phase = "done";
+                                app.index_backend = backend;
                                 app.all_items = items;
-                                app.last_action = format!(
-                                    "Indexed {} files [{}]",
-                                    app.all_items.len(),
-                                    app.scope.label()
-                                );
-                                app.refresh_results();
+                                app.filename_index_dirty = true;
+                                app.filename_index_building = false;
+                                app.filename_index_build_cursor = 0;
+                                app.recompute_index_memory_bytes();
+                                app.recent_event_by_path.clear();
+                                app.changes_added_since_index = 0;
+                                app.changes_updated_since_index = 0;
+                                app.changes_deleted_since_index = 0;
+                                debug_log(&format!(
+                                    "IndexEvent::Done job_id={} backend={} items={}",
+                                    job_id,
+                                    backend.label(),
+                                    app.all_items.len()
+                                ));
+                                if app.all_items.is_empty() && backend == IndexBackend::Detecting {
+                                    app.last_action =
+                                        "NTFS indexing unavailable (run elevated and ensure USN journal is available)"
+                                            .to_string();
+                                } else {
+                                    app.last_action = format!(
+                                        "Indexed {} files [{}]",
+                                        app.all_items.len(),
+                                        app.scope.label()
+                                    );
+                                }
+                                app.schedule_search_from_current_query();
+                            } else {
+                                debug_log(&format!(
+                                    "IndexEvent::Done ignored job_id={} active_job={:?} backend={} items={}",
+                                    job_id,
+                                    app.active_index_job,
+                                    backend.label(),
+                                    items.len()
+                                ));
                             }
                         }
                         IndexEvent::Delta {
@@ -343,15 +804,54 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                             deleted_paths,
                         } => {
                             if app.active_index_job == Some(job_id) {
-                                app.apply_index_delta(upserts, deleted_paths);
+                                debug_log(&format!(
+                                    "IndexEvent::Delta accepted job_id={} upserts={} deletes={}",
+                                    job_id,
+                                    upserts.len(),
+                                    deleted_paths.len()
+                                ));
+                                let (added, updated, deleted) =
+                                    app.apply_index_delta(upserts, deleted_paths);
+                                app.changes_added_since_index += added;
+                                app.changes_updated_since_index += updated;
+                                app.changes_deleted_since_index += deleted;
+                                app.recompute_index_memory_bytes();
                                 app.indexing_in_progress = false;
                                 app.indexing_progress = 1.0;
+                                app.indexing_phase = "live";
                                 app.last_action = format!(
                                     "Live index update: {} items [{}]",
                                     app.all_items.len(),
                                     app.scope.label()
                                 );
+                                app.schedule_search_from_current_query();
+                            } else {
+                                debug_log(&format!(
+                                    "IndexEvent::Delta ignored job_id={} active_job={:?}",
+                                    job_id, app.active_index_job
+                                ));
                             }
+                        }
+                    }
+                }
+            }
+
+            if app._hotkey_manager.is_none() || app._hotkey.is_none() {
+                let should_retry = app
+                    .hotkey_retry_after
+                    .is_none_or(|due| Instant::now() >= due);
+                if should_retry {
+                    match init_hotkey() {
+                        Ok((manager, hotkey)) => {
+                            app._hotkey_manager = manager;
+                            app._hotkey = hotkey;
+                            app.hotkey_retry_after = None;
+                            app.last_action = "Global hotkey ready".to_string();
+                        }
+                        Err(err) => {
+                            debug_log(&format!("hotkey retry failed: {}", err));
+                            app.hotkey_retry_after =
+                                Some(Instant::now() + Duration::from_millis(1200));
                         }
                     }
                 }
@@ -390,9 +890,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 
                 app.panel_visible = !app.panel_visible;
                 app.panel_anim_last_tick = None;
-                if app.panel_visible {
-                    app.last_action = "Panel shown".to_string();
-                }
 
                 let window_task = if app.panel_visible {
                     prepare_panel_for_show_mode()
@@ -417,7 +914,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
 
             if let KeyboardEvent::KeyPressed { key, modifiers, .. } = event {
-                let suggestions = command_menu_items(&app.raw_query);
+                let suggestions = command_menu_items(&app.raw_query, app.tracking_enabled);
                 let command_mode = !suggestions.is_empty();
 
                 match key.as_ref() {
@@ -454,8 +951,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     Key::Named(key::Named::Enter) if modifiers.alt() && !command_mode => {
                         if let Some(item) = app.items.get(app.selected) {
                             app.last_action = format!("Reveal: {}", item.path);
-                            let _ = reveal_path(&item.path);
+                            let _ = reveal_path(item.path.as_ref());
                         }
+                    }
+                    Key::Named(key::Named::Enter) if command_mode => {
+                        return Task::done(Message::ActivateSelected);
                     }
                     Key::Named(key::Named::Enter) => {}
                     _ => {}
@@ -471,15 +971,24 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 }
 
 fn view(app: &App) -> Element<'_, Message> {
+    let search_enabled = !app.indexing_in_progress;
     let prompt = row![
         text(">"),
-        text_input("Type to search files...", &app.raw_query)
-            .id(app.search_input_id.clone())
-            .on_input(Message::QueryChanged)
-            .on_submit(Message::ActivateSelected)
-            .padding(8)
-            .size(18)
-            .width(Fill)
+        if search_enabled {
+            text_input("Type to search files...", &app.raw_query)
+                .id(app.search_input_id.clone())
+                .on_input(Message::QueryChanged)
+                .on_submit(Message::ActivateSelected)
+                .padding(8)
+                .size(18)
+                .width(Fill)
+        } else {
+            text_input("Indexing in progress...", &app.raw_query)
+                .id(app.search_input_id.clone())
+                .padding(8)
+                .size(18)
+                .width(Fill)
+        }
     ]
     .spacing(8)
     .align_y(Alignment::Center);
@@ -487,12 +996,13 @@ fn view(app: &App) -> Element<'_, Message> {
     let mut listed = column![];
     for (index, item) in app.items.iter().enumerate() {
         let marker = if index == app.selected { ">" } else { " " };
-        let display_path = truncate_middle(&item.path, FILE_PATH_MAX_CHARS);
-        let name_color = file_type_color(&item.name);
+        let display_path = truncate_middle(item.path.as_ref(), FILE_PATH_MAX_CHARS);
+        let item_name = file_name_from_path(item.path.as_ref());
+        let name_color = file_type_color(item_name);
         listed = listed.push(
             row![
                 text(marker),
-                text(&item.name)
+                text(item_name)
                     .color(name_color)
                     .size(FILE_NAME_FONT_SIZE)
                     .width(Length::FillPortion(3)),
@@ -506,7 +1016,7 @@ fn view(app: &App) -> Element<'_, Message> {
         );
     }
 
-    let command_items = command_menu_items(&app.raw_query);
+    let command_items = command_menu_items(&app.raw_query, app.tracking_enabled);
     let mut command_dropdown = column![];
     for (index, item) in command_items.iter().enumerate() {
         let marker = if index == app.command_selected {
@@ -546,7 +1056,12 @@ fn view(app: &App) -> Element<'_, Message> {
         container(
             column![
                 text(format!(
-                    "Indexing {} ... {:.0}%",
+                    "{} {} ... {:.0}%",
+                    if app.indexing_phase == "write" {
+                        "Building index map"
+                    } else {
+                        "Indexing"
+                    },
                     app.scope.label(),
                     app.indexing_progress * 100.0
                 ))
@@ -563,24 +1078,126 @@ fn view(app: &App) -> Element<'_, Message> {
         container(column![]).height(Length::Shrink)
     };
 
+    let base_list = scrollable(listed)
+        .id(app.results_scroll_id.clone())
+        .height(Length::Fill);
+
+    let list_area: Element<'_, Message> = if app.show_privilege_overlay {
+        stack![
+            base_list,
+            container(
+                column![
+                    text("NOT ELEVATED")
+                        .size(58)
+                        .color(Color::from_rgb8(255, 64, 64)),
+                    text("NTFS access is unavailable in this mode")
+                        .size(22)
+                        .color(Color::from_rgb8(255, 150, 150)),
+                    text("Using DIRWALK fallback (SLOWER)")
+                        .size(24)
+                        .color(Color::from_rgb8(255, 92, 92)),
+                    text("Type /up and press Enter to relaunch elevated")
+                        .size(18)
+                        .color(Color::from_rgb8(255, 180, 180)),
+                    text("This message will go away as soon as you start to type")
+                        .size(16)
+                        .color(Color::from_rgb8(255, 205, 205)),
+                ]
+                .spacing(14)
+                .align_x(Alignment::Center),
+            )
+            .width(Fill)
+            .height(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(Color::from_rgba8(180, 20, 20, 0.1).into()),
+                ..container::Style::default()
+            })
+            .center_x(Fill)
+            .center_y(Fill)
+        ]
+        .into()
+    } else {
+        base_list.into()
+    };
+
     let content = column![
         prompt,
         command_dropdown,
         index_progress,
         text(format!(
-            "SCOPE: {} | SORT: relevance | RESULTS: {}",
+            "SCOPE: {}{} | MEM: {} | CHG: +{} ~{} -{} | SORT: relevance | RESULTS: {} | LAST: {}",
             app.scope.label(),
-            app.items.len()
-        ))
-        .size(14),
-        scrollable(listed)
-            .id(app.results_scroll_id.clone())
-            .height(Length::Fill),
-        text(format!(
-            "Enter select/open | Alt+Enter reveal | Esc hide | {}",
+            if app.latest_only_mode {
+                format!(
+                    " | FILTER: latest-{}",
+                    format_latest_window(app.latest_window_secs)
+                )
+            } else {
+                String::new()
+            },
+            format_bytes(app.index_memory_bytes),
+            app.changes_added_since_index,
+            app.changes_updated_since_index,
+            app.changes_deleted_since_index,
+            app.items.len(),
             app.last_action
         ))
-        .size(13)
+        .size(14),
+        list_area,
+        row![
+            container(text("Enter open | Alt+Enter reveal | Esc hide").size(13))
+                .width(Length::FillPortion(1))
+                .align_x(Horizontal::Left),
+            container(
+                row![
+                    text("IDX: ").size(13),
+                    text(app.index_backend.label())
+                        .size(13)
+                        .color(backend_status_color(app.index_backend)),
+                    text(" | LIVE: ").size(13),
+                    text(if app.index_backend.live_updates() {
+                        "on"
+                    } else {
+                        "off"
+                    })
+                    .size(13)
+                    .color(if app.index_backend.live_updates() {
+                        Color::from_rgb8(117, 227, 140)
+                    } else {
+                        Color::from_rgb8(184, 184, 184)
+                    }),
+                    text(" | JOB: ").size(13),
+                    text(
+                        app.active_index_job
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                    )
+                    .size(13)
+                    .color(Color::from_rgb8(130, 210, 255)),
+                ]
+                .spacing(0)
+                .align_y(Alignment::Center)
+            )
+            .width(Length::FillPortion(1))
+            .align_x(Horizontal::Center),
+            container(
+                row![
+                    text("STATE: ").size(13),
+                    text(if app.indexing_in_progress {
+                        "indexing"
+                    } else {
+                        "idle"
+                    })
+                    .size(13)
+                    .color(state_status_color(app.indexing_in_progress)),
+                ]
+                .spacing(0)
+                .align_y(Alignment::Center)
+            )
+            .width(Length::FillPortion(1))
+            .align_x(Horizontal::Right),
+        ]
+        .align_y(Alignment::Center)
     ]
     .spacing(10)
     .padding(12);
@@ -598,7 +1215,7 @@ fn theme(_app: &App) -> Theme {
 
 fn subscription(app: &App) -> Subscription<Message> {
     let mut subs = vec![
-        iced::time::every(Duration::from_millis(60)).map(|_| Message::PollExternal),
+        iced::time::every(POLL_INTERVAL).map(|_| Message::PollExternal),
         iced::keyboard::listen().map(Message::Keyboard),
     ];
 
@@ -647,30 +1264,76 @@ fn index_files_for_scope_with_progress(
     scope: SearchScope,
     job_id: u64,
     tx: &mpsc::Sender<IndexEvent>,
-) -> Vec<SearchItem> {
+    allow_dirwalk_fallback: bool,
+) -> (Vec<SearchItem>, IndexBackend) {
     let roots = scope_roots(&scope);
     let mut out = Vec::new();
     let mut scanned = 0usize;
+    let mut used_ntfs = false;
+    let mut used_walkdir = false;
 
     for root in roots {
-        if let Some(ntfs_items) =
-            try_index_ntfs_volume(&root, job_id, tx, MAX_INDEX_FILES - out.len())
-        {
+        let Some(drive_letter) = drive_letter_from_root_str(&root) else {
+            if !allow_dirwalk_fallback {
+                continue;
+            }
+
+            used_walkdir = true;
+            for entry in WalkDir::new(&root)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+
+                let path = entry.path().to_string_lossy().to_string();
+
+                out.push(SearchItem {
+                    path: path.into_boxed_str(),
+                    modified_unix_secs: UNKNOWN_TS,
+                });
+                scanned += 1;
+
+                if scanned.is_multiple_of(500) {
+                    let _ = tx.send(IndexEvent::Progress {
+                        job_id,
+                        current: scanned,
+                        total: 0,
+                        phase: "index",
+                    });
+                }
+            }
+            continue;
+        };
+
+        let volume_root = format!("{}:\\", drive_letter);
+
+        if let Some(mut ntfs_items) = try_index_ntfs_volume(&volume_root, job_id, tx) {
+            used_ntfs = true;
+            let before_filter = ntfs_items.len();
+
+            if matches!(scope, SearchScope::CurrentFolder) {
+                let prefix = normalized_folder_prefix(&root);
+                ntfs_items.retain(|item| path_starts_with_folder(item.path.as_ref(), &prefix));
+            }
+
+            let _ = before_filter;
+
             scanned += ntfs_items.len();
             out.extend(ntfs_items);
-
-            if out.len() >= MAX_INDEX_FILES {
-                let _ = tx.send(IndexEvent::Progress {
-                    job_id,
-                    scanned: MAX_INDEX_FILES,
-                });
-                return out;
-            }
 
             continue;
         }
 
-        for entry in WalkDir::new(root)
+        if !allow_dirwalk_fallback {
+            continue;
+        }
+
+        used_walkdir = true;
+
+        for entry in WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
             .filter_map(Result::ok)
@@ -680,27 +1343,40 @@ fn index_files_for_scope_with_progress(
             }
 
             let path = entry.path().to_string_lossy().to_string();
-            let name = entry.file_name().to_string_lossy().to_string();
 
-            out.push(SearchItem { name, path });
+            out.push(SearchItem {
+                path: path.into_boxed_str(),
+                modified_unix_secs: UNKNOWN_TS,
+            });
             scanned += 1;
 
             if scanned.is_multiple_of(500) {
-                let _ = tx.send(IndexEvent::Progress { job_id, scanned });
-            }
-
-            if out.len() >= MAX_INDEX_FILES {
                 let _ = tx.send(IndexEvent::Progress {
                     job_id,
-                    scanned: MAX_INDEX_FILES,
+                    current: scanned,
+                    total: 0,
+                    phase: "index",
                 });
-                return out;
             }
         }
     }
 
-    let _ = tx.send(IndexEvent::Progress { job_id, scanned });
-    out
+    let _ = tx.send(IndexEvent::Progress {
+        job_id,
+        current: scanned,
+        total: scanned.max(1),
+        phase: "index",
+    });
+    let backend = if used_ntfs && used_walkdir {
+        IndexBackend::Mixed
+    } else if used_ntfs {
+        IndexBackend::NtfsMft
+    } else if used_walkdir {
+        IndexBackend::WalkDir
+    } else {
+        IndexBackend::Detecting
+    };
+    (out, backend)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -708,7 +1384,6 @@ fn try_index_ntfs_volume(
     _root: &str,
     _job_id: u64,
     _tx: &mpsc::Sender<IndexEvent>,
-    _remaining: usize,
 ) -> Option<Vec<SearchItem>> {
     None
 }
@@ -719,6 +1394,8 @@ struct NtfsNode {
     parent_id: u64,
     name: String,
     is_dir: bool,
+    modified_unix_secs: i64,
+    file_attributes: u32,
 }
 
 #[cfg(target_os = "windows")]
@@ -726,31 +1403,9 @@ fn try_index_ntfs_volume(
     root: &str,
     job_id: u64,
     tx: &mpsc::Sender<IndexEvent>,
-    remaining: usize,
 ) -> Option<Vec<SearchItem>> {
-    if remaining == 0 {
-        return Some(Vec::new());
-    }
-
     let drive = parse_drive_root_letter(root)?;
-    let volume_path = format!(r"\\.\{}:", drive.to_ascii_uppercase());
-    let volume_wide = to_wide(&volume_path);
-
-    let handle = unsafe {
-        CreateFileW(
-            volume_wide.as_ptr(),
-            FILE_GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
+    let handle = open_volume_handle(drive)?;
 
     let mut journal = USN_JOURNAL_DATA_V0::default();
     let mut bytes_returned = 0u32;
@@ -768,6 +1423,11 @@ fn try_index_ntfs_volume(
     };
 
     if query_ok == 0 {
+        let err = unsafe { GetLastError() };
+        debug_log(&format!(
+            "try_index_ntfs_volume FSCTL_QUERY_USN_JOURNAL failed drive={} err={}",
+            drive, err
+        ));
         let _ = unsafe { CloseHandle(handle) };
         return None;
     }
@@ -777,6 +1437,9 @@ fn try_index_ntfs_volume(
         LowUsn: 0,
         HighUsn: journal.NextUsn,
     };
+
+    let usn_start = journal.FirstUsn.max(0);
+    let usn_total = (journal.NextUsn - usn_start).max(1) as usize;
 
     let mut raw_nodes: HashMap<u64, NtfsNode> = HashMap::new();
     let mut scanned = 0usize;
@@ -832,12 +1495,21 @@ fn try_index_ntfs_volume(
                             parent_id: rec.ParentFileReferenceNumber,
                             name,
                             is_dir,
+                            modified_unix_secs: filetime_100ns_to_unix_secs(rec.TimeStamp)
+                                .unwrap_or(UNKNOWN_TS),
+                            file_attributes: rec.FileAttributes,
                         },
                     );
 
                     scanned += 1;
                     if scanned.is_multiple_of(5000) {
-                        let _ = tx.send(IndexEvent::Progress { job_id, scanned });
+                        let current = (rec.Usn - usn_start).max(0) as usize;
+                        let _ = tx.send(IndexEvent::Progress {
+                            job_id,
+                            current: current.min(usn_total),
+                            total: usn_total,
+                            phase: "index",
+                        });
                     }
                 }
             }
@@ -857,14 +1529,10 @@ fn try_index_ntfs_volume(
             continue;
         }
 
-        if out.len() >= remaining {
-            break;
-        }
-
         let path = materialize_full_path(*id, &raw_nodes, &mut path_cache, &drive_prefix);
         out.push(SearchItem {
-            name: node.name.clone(),
-            path,
+            path: path.into_boxed_str(),
+            modified_unix_secs: node.modified_unix_secs,
         });
     }
 
@@ -902,26 +1570,59 @@ struct NtfsSnapshotNode {
     parent_id: u64,
     name: String,
     is_dir: bool,
+    #[serde(default = "unknown_ts")]
+    modified_unix_secs: i64,
+    #[serde(default)]
+    file_attributes: u32,
 }
 
 #[cfg(target_os = "windows")]
 fn run_ntfs_live_index_job(scope: SearchScope, job_id: u64, tx: &mpsc::Sender<IndexEvent>) -> bool {
     let mut states = Vec::new();
     for root in scope_roots(&scope) {
+        debug_log(&format!(
+            "run_ntfs_live_index_job opening state start job_id={} root={}",
+            job_id, root
+        ));
         if let Some(state) = open_ntfs_volume_state(&root, job_id, tx) {
+            debug_log(&format!(
+                "run_ntfs_live_index_job opening state success job_id={} root={} nodes={}",
+                job_id,
+                root,
+                state.nodes.len()
+            ));
             states.push(state);
+        } else {
+            debug_log(&format!(
+                "run_ntfs_live_index_job opening state failed job_id={} root={}",
+                job_id, root
+            ));
         }
     }
+
+    debug_log(&format!(
+        "run_ntfs_live_index_job job_id={} scope={} states={}",
+        job_id,
+        scope.label(),
+        states.len()
+    ));
 
     if states.is_empty() {
         return false;
     }
 
-    let initial = collect_items_from_ntfs_states(&mut states, MAX_INDEX_FILES);
+    let initial = collect_items_from_ntfs_states(&mut states);
+    persist_scope_snapshot_async(scope.clone(), initial.clone());
+    debug_log(&format!(
+        "run_ntfs_live_index_job initial done job_id={} items={}",
+        job_id,
+        initial.len()
+    ));
     if tx
         .send(IndexEvent::Done {
             job_id,
             items: initial,
+            backend: IndexBackend::NtfsUsnLive,
         })
         .is_err()
     {
@@ -945,6 +1646,12 @@ fn run_ntfs_live_index_job(scope: SearchScope, job_id: u64, tx: &mpsc::Sender<In
                     maybe_persist_ntfs_snapshot(state);
 
                     if !batch.upserts.is_empty() || !batch.deleted_paths.is_empty() {
+                        debug_log(&format!(
+                            "run_ntfs_live_index_job delta job_id={} upserts={} deletes={}",
+                            job_id,
+                            batch.upserts.len(),
+                            batch.deleted_paths.len()
+                        ));
                         if tx
                             .send(IndexEvent::Delta {
                                 job_id,
@@ -963,14 +1670,25 @@ fn run_ntfs_live_index_job(scope: SearchScope, job_id: u64, tx: &mpsc::Sender<In
                         continue;
                     }
 
-                    let items = collect_items_from_ntfs_states(
-                        std::slice::from_mut(state),
-                        MAX_INDEX_FILES,
-                    );
-                    if tx.send(IndexEvent::Done { job_id, items }).is_err() {
+                    let items = collect_items_from_ntfs_states(std::slice::from_mut(state));
+                    let items_len = items.len();
+                    persist_scope_snapshot_async(scope.clone(), items.clone());
+                    if tx
+                        .send(IndexEvent::Done {
+                            job_id,
+                            items,
+                            backend: IndexBackend::NtfsUsnLive,
+                        })
+                        .is_err()
+                    {
                         keep_running = false;
                         break;
                     }
+
+                    debug_log(&format!(
+                        "run_ntfs_live_index_job recovery done job_id={} items_sent={}",
+                        job_id, items_len
+                    ));
                 }
             }
         }
@@ -996,31 +1714,37 @@ fn open_ntfs_volume_state(
     job_id: u64,
     tx: &mpsc::Sender<IndexEvent>,
 ) -> Option<NtfsVolumeState> {
+    debug_log(&format!(
+        "open_ntfs_volume_state start job_id={} root={}",
+        job_id, root
+    ));
     let drive = parse_drive_root_letter(root)?;
+    debug_log(&format!(
+        "open_ntfs_volume_state parsed drive job_id={} drive={}",
+        job_id, drive
+    ));
     let (handle, journal) = open_volume_and_query_journal(drive)?;
-    let snapshot = load_ntfs_snapshot(drive);
+    debug_log(&format!(
+        "open_ntfs_volume_state journal job_id={} drive={} first_usn={} next_usn={}",
+        job_id, drive, journal.FirstUsn, journal.NextUsn
+    ));
+    debug_log(&format!(
+        "open_ntfs_volume_state snapshot restore skipped job_id={} drive={}",
+        job_id, drive
+    ));
 
-    let (nodes, next_usn) = if let Some(snapshot) = snapshot {
-        if snapshot.version == 1
-            && snapshot.journal_id == journal.UsnJournalID
-            && snapshot.next_usn >= journal.FirstUsn
-            && snapshot.next_usn <= journal.NextUsn
-        {
-            (snapshot_nodes_to_map(snapshot.nodes), snapshot.next_usn)
-        } else {
-            let Some(nodes) = enumerate_ntfs_nodes(handle, journal.NextUsn, job_id, tx) else {
-                let _ = unsafe { CloseHandle(handle) };
-                return None;
-            };
-            (nodes, journal.NextUsn)
-        }
-    } else {
-        let Some(nodes) = enumerate_ntfs_nodes(handle, journal.NextUsn, job_id, tx) else {
-            let _ = unsafe { CloseHandle(handle) };
-            return None;
-        };
-        (nodes, journal.NextUsn)
+    let Some(nodes) = enumerate_ntfs_nodes(handle, journal.FirstUsn, journal.NextUsn, job_id, tx)
+    else {
+        let _ = unsafe { CloseHandle(handle) };
+        return None;
     };
+    debug_log(&format!(
+        "open_ntfs_volume_state enumerate complete job_id={} drive={} nodes={}",
+        job_id,
+        drive,
+        nodes.len()
+    ));
+    let next_usn = journal.NextUsn;
 
     let mut state = NtfsVolumeState {
         drive_letter: drive,
@@ -1035,9 +1759,14 @@ fn open_ntfs_volume_state(
         changed_since_snapshot: 0,
     };
 
-    initialize_id_path_map(&mut state);
+    initialize_id_path_map(&mut state, job_id, tx);
     persist_usn_checkpoint(drive, state.journal_id, state.next_usn);
-    persist_ntfs_snapshot(&mut state);
+    debug_log(&format!(
+        "open_ntfs_volume_state ready job_id={} drive={} nodes={} (skip initial snapshot write)",
+        job_id,
+        drive,
+        state.nodes.len()
+    ));
 
     Some(state)
 }
@@ -1045,21 +1774,33 @@ fn open_ntfs_volume_state(
 #[cfg(target_os = "windows")]
 fn enumerate_ntfs_nodes(
     handle: HANDLE,
+    low_usn: i64,
     high_usn: i64,
     job_id: u64,
     tx: &mpsc::Sender<IndexEvent>,
 ) -> Option<HashMap<u64, NtfsNode>> {
+    debug_log(&format!(
+        "enumerate_ntfs_nodes start job_id={} high_usn={}",
+        job_id, high_usn
+    ));
     let mut enum_data = MFT_ENUM_DATA_V0 {
         StartFileReferenceNumber: 0,
         LowUsn: 0,
         HighUsn: high_usn,
     };
 
+    let progress_low = low_usn.max(0);
+    let progress_total = (high_usn - progress_low).max(1) as usize;
+
     let mut raw_nodes: HashMap<u64, NtfsNode> = HashMap::new();
     let mut scanned = 0usize;
     let mut buffer = vec![0u8; 1024 * 1024];
 
     loop {
+        debug_log(&format!(
+            "enumerate_ntfs_nodes ioctl start job_id={} start_frn={}",
+            job_id, enum_data.StartFileReferenceNumber
+        ));
         let mut out_bytes = 0u32;
         let ok = unsafe {
             DeviceIoControl(
@@ -1077,8 +1818,17 @@ fn enumerate_ntfs_nodes(
         if ok == 0 {
             let err = unsafe { GetLastError() };
             if err == ERROR_HANDLE_EOF || err == ERROR_INVALID_FUNCTION {
+                debug_log(&format!(
+                    "enumerate_ntfs_nodes ioctl reached end job_id={} err={}",
+                    job_id, err
+                ));
                 break;
             }
+
+            debug_log(&format!(
+                "enumerate_ntfs_nodes ioctl failed job_id={} err={}",
+                job_id, err
+            ));
 
             return None;
         }
@@ -1107,12 +1857,25 @@ fn enumerate_ntfs_nodes(
                             parent_id: rec.ParentFileReferenceNumber,
                             name,
                             is_dir,
+                            modified_unix_secs: filetime_100ns_to_unix_secs(rec.TimeStamp)
+                                .unwrap_or(UNKNOWN_TS),
+                            file_attributes: rec.FileAttributes,
                         },
                     );
 
                     scanned += 1;
                     if scanned.is_multiple_of(5000) {
-                        let _ = tx.send(IndexEvent::Progress { job_id, scanned });
+                        debug_log(&format!(
+                            "enumerate_ntfs_nodes progress job_id={} scanned={}",
+                            job_id, scanned
+                        ));
+                        let current = (rec.Usn - progress_low).max(0) as usize;
+                        let _ = tx.send(IndexEvent::Progress {
+                            job_id,
+                            current: current.min(progress_total),
+                            total: progress_total,
+                            phase: "index",
+                        });
                     }
                 }
             }
@@ -1120,6 +1883,12 @@ fn enumerate_ntfs_nodes(
             offset += record_len;
         }
     }
+
+    debug_log(&format!(
+        "enumerate_ntfs_nodes done job_id={} nodes={}",
+        job_id,
+        raw_nodes.len()
+    ));
 
     Some(raw_nodes)
 }
@@ -1211,12 +1980,17 @@ fn poll_ntfs_journal(state: &mut NtfsVolumeState) -> Option<JournalBatch> {
                     parent_id: rec.ParentFileReferenceNumber,
                     name,
                     is_dir,
+                    modified_unix_secs: filetime_100ns_to_unix_secs(rec.TimeStamp)
+                        .unwrap_or(UNKNOWN_TS),
+                    file_attributes: rec.FileAttributes,
                 };
 
                 let needs_update = state.nodes.get(&id).map_or(true, |existing| {
                     existing.parent_id != new_node.parent_id
                         || existing.name != new_node.name
                         || existing.is_dir != new_node.is_dir
+                        || existing.modified_unix_secs != new_node.modified_unix_secs
+                        || existing.file_attributes != new_node.file_attributes
                 });
 
                 if needs_update {
@@ -1263,8 +2037,8 @@ fn poll_ntfs_journal(state: &mut NtfsVolumeState) -> Option<JournalBatch> {
         }
 
         upserts.push(SearchItem {
-            name: node.name.clone(),
-            path,
+            path: path.into_boxed_str(),
+            modified_unix_secs: node.modified_unix_secs,
         });
     }
 
@@ -1307,17 +2081,13 @@ fn remove_ntfs_node_and_descendants(nodes: &mut HashMap<u64, NtfsNode>, id: u64)
 }
 
 #[cfg(target_os = "windows")]
-fn collect_items_from_ntfs_states(states: &mut [NtfsVolumeState], limit: usize) -> Vec<SearchItem> {
+fn collect_items_from_ntfs_states(states: &mut [NtfsVolumeState]) -> Vec<SearchItem> {
     let mut out = Vec::new();
 
     for state in states {
         for (id, node) in &state.nodes {
             if node.is_dir {
                 continue;
-            }
-
-            if out.len() >= limit {
-                return out;
             }
 
             let path = materialize_full_path(
@@ -1327,8 +2097,8 @@ fn collect_items_from_ntfs_states(states: &mut [NtfsVolumeState], limit: usize) 
                 &state.drive_prefix,
             );
             out.push(SearchItem {
-                name: node.name.clone(),
-                path,
+                path: path.into_boxed_str(),
+                modified_unix_secs: node.modified_unix_secs,
             });
         }
     }
@@ -1337,7 +2107,7 @@ fn collect_items_from_ntfs_states(states: &mut [NtfsVolumeState], limit: usize) 
 }
 
 #[cfg(target_os = "windows")]
-fn initialize_id_path_map(state: &mut NtfsVolumeState) {
+fn initialize_id_path_map(state: &mut NtfsVolumeState, job_id: u64, tx: &mpsc::Sender<IndexEvent>) {
     state.id_to_path.clear();
 
     let ids: Vec<u64> = state
@@ -1346,27 +2116,39 @@ fn initialize_id_path_map(state: &mut NtfsVolumeState) {
         .filter_map(|(id, node)| (!node.is_dir).then_some(*id))
         .collect();
 
-    for id in ids {
+    debug_log(&format!(
+        "initialize_id_path_map start job_id={} total_ids={}",
+        job_id,
+        ids.len()
+    ));
+
+    let ids_total = ids.len().max(1);
+
+    for (idx, id) in ids.into_iter().enumerate() {
         let path =
             materialize_full_path(id, &state.nodes, &mut state.path_cache, &state.drive_prefix);
         state.id_to_path.insert(id, path);
-    }
-}
 
-#[cfg(target_os = "windows")]
-fn snapshot_nodes_to_map(nodes: Vec<NtfsSnapshotNode>) -> HashMap<u64, NtfsNode> {
-    let mut map = HashMap::with_capacity(nodes.len());
-    for node in nodes {
-        map.insert(
-            node.id,
-            NtfsNode {
-                parent_id: node.parent_id,
-                name: node.name,
-                is_dir: node.is_dir,
-            },
-        );
+        if (idx + 1).is_multiple_of(5000) {
+            let _ = tx.send(IndexEvent::Progress {
+                job_id,
+                current: idx + 1,
+                total: ids_total,
+                phase: "write",
+            });
+            debug_log(&format!(
+                "initialize_id_path_map progress job_id={} processed={}",
+                job_id,
+                idx + 1
+            ));
+        }
     }
-    map
+
+    debug_log(&format!(
+        "initialize_id_path_map done job_id={} built_paths={}",
+        job_id,
+        state.id_to_path.len()
+    ));
 }
 
 #[cfg(target_os = "windows")]
@@ -1407,7 +2189,9 @@ fn recover_ntfs_state(
         return true;
     }
 
-    let Some(nodes) = enumerate_ntfs_nodes(new_handle, journal.NextUsn, job_id, tx) else {
+    let Some(nodes) =
+        enumerate_ntfs_nodes(new_handle, journal.FirstUsn, journal.NextUsn, job_id, tx)
+    else {
         let _ = unsafe { CloseHandle(new_handle) };
         return false;
     };
@@ -1417,11 +2201,15 @@ fn recover_ntfs_state(
     state.next_usn = journal.NextUsn;
     state.nodes = nodes;
     state.path_cache.clear();
-    initialize_id_path_map(state);
+    initialize_id_path_map(state, job_id, tx);
     state.changed_since_snapshot = 0;
     state.last_snapshot_write = Instant::now();
     persist_usn_checkpoint(state.drive_letter, state.journal_id, state.next_usn);
-    persist_ntfs_snapshot(state);
+    debug_log(&format!(
+        "recover_ntfs_state rebuilt state drive={} nodes={} (skip immediate snapshot write)",
+        state.drive_letter,
+        state.nodes.len()
+    ));
 
     let _ = unsafe { CloseHandle(old_handle) };
     true
@@ -1429,24 +2217,7 @@ fn recover_ntfs_state(
 
 #[cfg(target_os = "windows")]
 fn open_volume_and_query_journal(drive: char) -> Option<(HANDLE, USN_JOURNAL_DATA_V0)> {
-    let volume_path = format!(r"\\.\{}:", drive.to_ascii_uppercase());
-    let volume_wide = to_wide(&volume_path);
-
-    let handle = unsafe {
-        CreateFileW(
-            volume_wide.as_ptr(),
-            FILE_GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
+    let handle = open_volume_handle(drive)?;
 
     let mut journal = USN_JOURNAL_DATA_V0::default();
     let mut bytes_returned = 0u32;
@@ -1464,11 +2235,54 @@ fn open_volume_and_query_journal(drive: char) -> Option<(HANDLE, USN_JOURNAL_DAT
     };
 
     if query_ok == 0 {
+        let err = unsafe { GetLastError() };
+        debug_log(&format!(
+            "open_volume_and_query_journal FSCTL_QUERY_USN_JOURNAL failed drive={} err={}",
+            drive, err
+        ));
         let _ = unsafe { CloseHandle(handle) };
         return None;
     }
 
     Some((handle, journal))
+}
+
+#[cfg(target_os = "windows")]
+fn open_volume_handle(drive: char) -> Option<HANDLE> {
+    let volume_path = format!(r"\\.\{}:", drive.to_ascii_uppercase());
+    let volume_wide = to_wide(&volume_path);
+
+    for desired_access in [FILE_GENERIC_READ, 0] {
+        let handle = unsafe {
+            CreateFileW(
+                volume_wide.as_ptr(),
+                desired_access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if handle != INVALID_HANDLE_VALUE {
+            if desired_access == 0 {
+                debug_log(&format!(
+                    "open_volume_handle drive={} succeeded with desired_access=0",
+                    drive
+                ));
+            }
+            return Some(handle);
+        }
+
+        let err = unsafe { GetLastError() };
+        debug_log(&format!(
+            "open_volume_handle drive={} failed desired_access={} err={}",
+            drive, desired_access, err
+        ));
+    }
+
+    None
 }
 
 #[cfg(target_os = "windows")]
@@ -1567,14 +2381,7 @@ fn snapshot_file_path(drive: char) -> std::path::PathBuf {
     std::path::PathBuf::from(base)
         .join("WizMini")
         .join("snapshots")
-        .join(format!("{}.json", drive.to_ascii_uppercase()))
-}
-
-#[cfg(target_os = "windows")]
-fn load_ntfs_snapshot(drive: char) -> Option<NtfsSnapshot> {
-    let path = snapshot_file_path(drive);
-    let file = std::fs::File::open(path).ok()?;
-    serde_json::from_reader(file).ok()
+        .join(format!("{}.bin", drive.to_ascii_uppercase()))
 }
 
 #[cfg(target_os = "windows")]
@@ -1607,6 +2414,8 @@ fn persist_ntfs_snapshot(state: &mut NtfsVolumeState) {
             parent_id: node.parent_id,
             name: node.name.clone(),
             is_dir: node.is_dir,
+            modified_unix_secs: node.modified_unix_secs,
+            file_attributes: node.file_attributes,
         });
     }
 
@@ -1622,7 +2431,7 @@ fn persist_ntfs_snapshot(state: &mut NtfsVolumeState) {
         return;
     };
 
-    if serde_json::to_writer(file, &snapshot).is_ok() {
+    if bincode::serialize_into(file, &snapshot).is_ok() {
         state.last_snapshot_write = Instant::now();
         state.changed_since_snapshot = 0;
     }
@@ -1748,139 +2557,92 @@ fn drive_letter_from_path(path: &std::path::Path) -> Option<char> {
     }
 }
 
-struct ParsedDirective {
-    scope_override: Option<SearchScope>,
-    clean_query: String,
-    test_progress: bool,
-    exit_app: bool,
-}
-
-fn parse_scope_directive(input: &str) -> ParsedDirective {
-    let mut scope_override = None;
-    let mut remaining = Vec::new();
-    let mut test_progress = false;
-    let mut exit_app = false;
-
-    for token in input.split_whitespace() {
-        let normalized = token.to_ascii_lowercase();
-
-        if normalized == "/entire" {
-            scope_override = Some(SearchScope::EntireCurrentDrive);
-            continue;
-        }
-
-        if normalized == "/all" {
-            scope_override = Some(SearchScope::AllLocalDrives);
-            continue;
-        }
-
-        if let Some(letter) = parse_drive_directive(&normalized) {
-            scope_override = Some(SearchScope::Drive(letter));
-            continue;
-        }
-
-        if normalized == "/testprogress" {
-            test_progress = true;
-            continue;
-        }
-
-        if normalized == "/exit" {
-            exit_app = true;
-            continue;
-        }
-
-        if normalized.starts_with('/') {
-            continue;
-        }
-
-        remaining.push(token);
-    }
-
-    ParsedDirective {
-        scope_override,
-        clean_query: remaining.join(" "),
-        test_progress,
-        exit_app,
-    }
-}
-
-struct CommandMenuItem {
-    command: &'static str,
-    description: &'static str,
-}
-
-fn command_menu_items(input: &str) -> Vec<CommandMenuItem> {
-    let trimmed = input.trim_start();
-    if !trimmed.starts_with('/') {
-        return Vec::new();
-    }
-
-    let prefix = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    let items = [
-        CommandMenuItem {
-            command: "/entire",
-            description: "Search entire current drive",
-        },
-        CommandMenuItem {
-            command: "/all",
-            description: "Search all local drives",
-        },
-        CommandMenuItem {
-            command: "/x:",
-            description: "Search specific drive (example /d:)",
-        },
-        CommandMenuItem {
-            command: "/testProgress",
-            description: "Visual progress bar test",
-        },
-        CommandMenuItem {
-            command: "/exit",
-            description: "Exit app immediately",
-        },
-    ];
-
-    items
-        .into_iter()
-        .filter(|item| {
-            if prefix == "/" {
-                return true;
-            }
-
-            item.command.to_ascii_lowercase().starts_with(&prefix)
-                || (prefix.len() == 3
-                    && prefix.starts_with('/')
-                    && prefix.ends_with(':')
-                    && prefix.as_bytes()[1].is_ascii_alphabetic()
-                    && item.command == "/x:")
-        })
-        .collect()
-}
-
-fn apply_command_choice(raw_query: &str, command: &str) -> String {
-    let trimmed = raw_query.trim_start();
-    let mut parts = trimmed.split_whitespace();
-    let _first = parts.next();
-    let rest = parts.collect::<Vec<_>>().join(" ");
-
-    if rest.is_empty() {
-        format!("{} ", command)
-    } else {
-        format!("{} {}", command, rest)
-    }
-}
-
-fn parse_drive_directive(token: &str) -> Option<char> {
-    let bytes = token.as_bytes();
-    if bytes.len() == 3 && bytes[0] == b'/' && bytes[2] == b':' && bytes[1].is_ascii_alphabetic() {
-        Some((bytes[1] as char).to_ascii_uppercase())
+fn drive_letter_from_root_str(root: &str) -> Option<char> {
+    let bytes = root.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        Some((bytes[0] as char).to_ascii_uppercase())
     } else {
         None
     }
+}
+
+fn normalized_folder_prefix(path: &str) -> String {
+    let mut normalized = path.replace('/', "\\").to_ascii_lowercase();
+    if !normalized.ends_with('\\') {
+        normalized.push('\\');
+    }
+    normalized
+}
+
+fn path_starts_with_folder(path: &str, folder_prefix: &str) -> bool {
+    let normalized = path.replace('/', "\\").to_ascii_lowercase();
+    normalized.starts_with(folder_prefix)
+}
+
+fn debug_log(message: &str) {
+    if !*DEBUG_ENABLED.get_or_init(|| false) {
+        return;
+    }
+
+    let line = format!("[wizmini-debug] {}\n", message);
+
+    if let Some(files_mutex) = DEBUG_LOG_FILES.get() {
+        if let Ok(mut files) = files_mutex.lock() {
+            for file in files.iter_mut() {
+                let _ = file.write_all(line.as_bytes());
+                let _ = file.flush();
+            }
+        }
+    }
+
+    eprintln!("{}", line.trim_end());
+}
+
+fn unknown_ts() -> i64 {
+    UNKNOWN_TS
+}
+
+#[cfg(target_os = "windows")]
+fn is_process_elevated() -> bool {
+    unsafe { IsUserAnAdmin() != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_process_elevated() -> bool {
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn request_self_elevation(scope: &SearchScope) -> Result<(), String> {
+    let exe_path = env::current_exe().map_err(|e| e.to_string())?;
+    let exe = to_wide(exe_path.to_string_lossy().as_ref());
+    let verb = to_wide("runas");
+    let params = to_wide(&format!("--show --scope={}", scope_arg_value(scope)));
+
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            exe.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWDEFAULT,
+        )
+    } as isize;
+
+    if result <= 32 {
+        Err(format!(
+            "UAC elevation failed or cancelled (code {})",
+            result
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn request_self_elevation(_scope: &SearchScope) -> Result<(), String> {
+    Err("Elevation is only supported on Windows".to_string())
 }
 
 fn open_path(path: &str) -> Result<(), String> {
@@ -1971,11 +2733,50 @@ fn sync_window_to_progress(progress: f32) -> Task<Message> {
 }
 
 impl App {
-    fn apply_raw_query(&mut self, raw_query: String) -> Task<Message> {
+    fn try_restore_scope_snapshot(&mut self) {
+        let Some(items) = load_scope_snapshot(&self.scope) else {
+            return;
+        };
+
+        self.all_items = items;
+        self.recompute_index_memory_bytes();
+        self.schedule_search_from_current_query();
+        self.last_action = format!(
+            "Loaded snapshot: {} items [{}]",
+            self.all_items.len(),
+            self.scope.label()
+        );
+    }
+
+    fn apply_raw_query(&mut self, raw_query: String, execute_directives: bool) -> Task<Message> {
+        self.pending_query = None;
+        self.needs_search_refresh = false;
         self.raw_query = raw_query;
 
         let parsed = parse_scope_directive(&self.raw_query);
+        debug_log(&format!(
+            "apply_raw_query execute={} raw='{}' clean='{}' scope_override={:?} latest_only={} latest_window_secs={:?} reindex_current_scope={} toggle_tracking={} test_progress={} exit_app={}",
+            execute_directives,
+            self.raw_query,
+            parsed.clean_query,
+            parsed.scope_override,
+            parsed.latest_only,
+            parsed.latest_window_secs,
+            parsed.reindex_current_scope,
+            parsed.toggle_tracking,
+            parsed.test_progress,
+            parsed.exit_app
+        ));
         self.query = parsed.clean_query;
+
+        if !execute_directives {
+            let cmd = self.raw_query.trim_start();
+            if !cmd.starts_with("/latest") && !cmd.starts_with("/last") {
+                self.latest_only_mode = false;
+            }
+            self.schedule_search_from_current_query();
+            return Task::none();
+        }
 
         if parsed.test_progress {
             self.visual_progress_test_active = true;
@@ -1989,54 +2790,386 @@ impl App {
             return iced::exit();
         }
 
-        if let Some(new_scope) = parsed.scope_override {
-            if new_scope != self.scope {
-                self.scope = new_scope;
-                self.all_items.clear();
-                self.items.clear();
-                self.selected = 0;
-                self.last_action = format!("Indexing scope: {}", self.scope.label());
-                return Task::done(Message::StartIndex(self.scope.clone()));
+        if parsed.elevate_app {
+            if self.is_elevated {
+                self.last_action = "Already elevated".to_string();
+                return Task::none();
+            }
+
+            match request_self_elevation(&SearchScope::EntireCurrentDrive) {
+                Ok(()) => return iced::exit(),
+                Err(err) => {
+                    self.last_action = err;
+                    return Task::none();
+                }
             }
         }
 
-        self.refresh_results();
+        if parsed.latest_only {
+            if !self.tracking_enabled {
+                self.last_action = "Tracking is off (use /track to enable)".to_string();
+                return Task::none();
+            }
+
+            self.latest_only_mode = true;
+            if let Some(window_secs) = parsed.latest_window_secs {
+                self.latest_window_secs = window_secs;
+            }
+            self.query.clear();
+            self.last_action = format!(
+                "Showing files changed in last {}",
+                format_latest_window(self.latest_window_secs)
+            );
+            self.schedule_search_from_current_query();
+            return Task::none();
+        }
+
+        if parsed.toggle_tracking {
+            self.tracking_enabled = !self.tracking_enabled;
+            self.latest_only_mode = false;
+            self.recent_event_by_path.clear();
+            if self.tracking_enabled {
+                self.last_action = "Tracking enabled".to_string();
+            } else {
+                self.last_action = "Tracking disabled".to_string();
+                self.changes_added_since_index = 0;
+                self.changes_updated_since_index = 0;
+                self.changes_deleted_since_index = 0;
+            }
+            return Task::none();
+        }
+
+        if parsed.reindex_current_scope {
+            self.latest_only_mode = false;
+            self.query.clear();
+            self.last_action = format!("Reindexing scope: {}", self.scope.label());
+            return Task::done(Message::StartIndex(self.scope.clone()));
+        }
+
+        let cmd = self.raw_query.trim_start();
+        if !cmd.starts_with("/latest") && !cmd.starts_with("/last") {
+            self.latest_only_mode = false;
+        }
+
+        if let Some(new_scope) = parsed.scope_override {
+            if self.indexing_in_progress && self.scope == new_scope {
+                self.last_action = format!("Already indexing scope: {}", self.scope.label());
+                return Task::none();
+            }
+
+            self.scope = new_scope;
+            self.all_items.clear();
+            self.items.clear();
+            self.selected = 0;
+            self.last_action = format!("Indexing scope: {}", self.scope.label());
+            debug_log(&format!(
+                "apply_raw_query starting index for scope={} ",
+                self.scope.label()
+            ));
+            return Task::done(Message::StartIndex(self.scope.clone()));
+        }
+
+        self.schedule_search_from_current_query();
         Task::none()
     }
 
     fn begin_index(&mut self, scope: SearchScope) {
         self.index_job_counter += 1;
         let job_id = self.index_job_counter;
+        debug_log(&format!(
+            "begin_index job_id={} scope={}",
+            job_id,
+            scope.label()
+        ));
         self.active_index_job = Some(job_id);
         self.scope = scope.clone();
-        persist_scope(&self.scope);
+        if self.skip_scope_persist_once {
+            self.skip_scope_persist_once = false;
+        } else {
+            persist_scope(&self.scope);
+        }
         self.visual_progress_test_active = false;
         self.indexing_in_progress = true;
         self.indexing_progress = 0.0;
+        self.indexing_phase = "index";
+        self.index_backend = IndexBackend::Detecting;
+        self.index_memory_bytes = 0;
+        self.filename_index_dirty = true;
+        self.filename_index_building = false;
+        self.filename_index_build_cursor = 0;
+        self.needs_search_refresh = false;
+        self.recent_event_by_path.clear();
+        self.changes_added_since_index = 0;
+        self.changes_updated_since_index = 0;
+        self.changes_deleted_since_index = 0;
+
+        if let Some(items) = load_scope_snapshot(&scope) {
+            self.all_items = items;
+            self.recompute_index_memory_bytes();
+            self.schedule_search_from_current_query();
+            self.last_action = format!(
+                "Loaded snapshot: {} items [{}]",
+                self.all_items.len(),
+                self.scope.label()
+            );
+        }
 
         let (tx, rx) = mpsc::channel::<IndexEvent>();
         self.index_rx = Some(rx);
 
+        let allow_dirwalk_fallback = self.use_dirwalk_fallback;
         thread::spawn(move || {
-            run_index_job(scope, job_id, tx);
+            run_index_job(scope, job_id, tx, allow_dirwalk_fallback);
         });
     }
 
-    fn refresh_results(&mut self) {
+    fn recompute_index_memory_bytes(&mut self) {
+        self.index_memory_bytes = estimate_index_memory_bytes(&self.all_items);
+    }
+
+    fn schedule_search_from_current_query(&mut self) {
         let q = self.query.trim().to_ascii_lowercase();
 
-        if q.is_empty() {
-            self.items = self.all_items.iter().take(600).cloned().collect();
-        } else {
+        if q.is_empty() && !self.latest_only_mode {
             self.items = self
                 .all_items
                 .iter()
-                .filter(|item| query_matches_item(&q, item))
-                .take(600)
+                .take(VISIBLE_RESULTS_LIMIT)
                 .cloned()
                 .collect();
+            self.active_search_query = None;
+            self.active_search_cursor = 0;
+            self.active_search_results.clear();
+            self.clamp_selected();
+        } else {
+            if !self.latest_only_mode {
+                if let Some(results) = self.try_fast_filename_search(&q) {
+                    self.items = results;
+                    self.active_search_query = None;
+                    self.active_search_cursor = 0;
+                    self.active_search_results.clear();
+                    self.clamp_selected();
+                    return;
+                }
+            }
+
+            self.active_search_query = Some(q);
+            self.active_search_cursor = 0;
+            self.active_search_results.clear();
+        }
+    }
+
+    fn process_filename_index_build_step(&mut self) {
+        if !self.filename_index_dirty {
+            return;
         }
 
+        if !self.filename_index_building {
+            self.filename_exact_index.clear();
+            self.filename_prefix_index.clear();
+            self.filename_index_build_cursor = 0;
+            self.filename_index_building = true;
+        }
+
+        let end = (self.filename_index_build_cursor + FILENAME_INDEX_BUILD_BATCH)
+            .min(self.all_items.len());
+        for index in self.filename_index_build_cursor..end {
+            let item = &self.all_items[index];
+            let name_lower = file_name_from_path(item.path.as_ref()).to_ascii_lowercase();
+            self.filename_exact_index
+                .entry(name_lower.clone())
+                .or_default()
+                .push(index);
+
+            let mut prefix = String::new();
+            for ch in name_lower.chars().take(3) {
+                prefix.push(ch);
+                self.filename_prefix_index
+                    .entry(prefix.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+
+        self.filename_index_build_cursor = end;
+        if self.filename_index_build_cursor >= self.all_items.len() {
+            self.filename_index_dirty = false;
+            self.filename_index_building = false;
+            self.filename_index_build_cursor = 0;
+        }
+    }
+
+    fn try_fast_filename_search(&mut self, query_lower: &str) -> Option<Vec<SearchItem>> {
+        if query_lower.is_empty()
+            || query_lower.contains('*')
+            || query_lower.contains('?')
+            || query_lower.contains('\\')
+            || query_lower.contains('/')
+            || query_lower.contains(':')
+        {
+            return None;
+        }
+
+        if self.filename_index_dirty || self.filename_index_building {
+            return None;
+        }
+
+        let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        if let Some(exact) = self.filename_exact_index.get(query_lower) {
+            for &idx in exact {
+                if seen.insert(idx) {
+                    out.push(self.all_items[idx].clone());
+                    if out.len() >= VISIBLE_RESULTS_LIMIT {
+                        return Some(out);
+                    }
+                }
+            }
+        }
+
+        let mut prefix_key = String::new();
+        for ch in query_lower.chars().take(3) {
+            prefix_key.push(ch);
+        }
+
+        if let Some(candidates) = self.filename_prefix_index.get(&prefix_key) {
+            for &idx in candidates {
+                if seen.contains(&idx) {
+                    continue;
+                }
+
+                let name = file_name_from_path(self.all_items[idx].path.as_ref());
+                if contains_ascii_case_insensitive(name, query_lower) {
+                    seen.insert(idx);
+                    out.push(self.all_items[idx].clone());
+                    if out.len() >= VISIBLE_RESULTS_LIMIT {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    fn process_search_step(&mut self) {
+        let Some(query) = self.active_search_query.clone() else {
+            return;
+        };
+
+        let latest_cutoff = if self.latest_only_mode {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            Some(now - self.latest_window_secs)
+        } else {
+            None
+        };
+
+        if self.latest_only_mode && query.is_empty() {
+            let cutoff = latest_cutoff.unwrap_or(i64::MIN);
+            let mut matched: Vec<SearchItem> = self
+                .all_items
+                .iter()
+                .filter(|item| {
+                    self.recent_event_by_path
+                        .get(item.path.as_ref())
+                        .copied()
+                        .or((item.modified_unix_secs != UNKNOWN_TS)
+                            .then_some(item.modified_unix_secs))
+                        .map(|ts| ts >= cutoff)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+
+            matched.sort_by_key(|item| {
+                std::cmp::Reverse(
+                    self.recent_event_by_path
+                        .get(item.path.as_ref())
+                        .copied()
+                        .or((item.modified_unix_secs != UNKNOWN_TS)
+                            .then_some(item.modified_unix_secs))
+                        .unwrap_or(i64::MIN),
+                )
+            });
+            if matched.len() > VISIBLE_RESULTS_LIMIT {
+                matched.truncate(VISIBLE_RESULTS_LIMIT);
+            }
+
+            self.items = matched;
+            self.active_search_query = None;
+            self.active_search_cursor = 0;
+            self.active_search_results.clear();
+            self.clamp_selected();
+            return;
+        }
+
+        let start = self.active_search_cursor;
+        if start >= self.all_items.len() {
+            self.items = std::mem::take(&mut self.active_search_results);
+            self.active_search_query = None;
+            self.active_search_cursor = 0;
+            self.clamp_selected();
+            return;
+        }
+
+        let end = (start + SEARCH_BATCH_SIZE).min(self.all_items.len());
+        for item in &self.all_items[start..end] {
+            let matches_latest = latest_cutoff
+                .map(|cutoff| {
+                    self.recent_event_by_path
+                        .get(item.path.as_ref())
+                        .copied()
+                        .or((item.modified_unix_secs != UNKNOWN_TS)
+                            .then_some(item.modified_unix_secs))
+                        .map(|ts| ts >= cutoff)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+
+            let matches_query = if query.is_empty() {
+                true
+            } else {
+                query_matches_item(&query, item)
+            };
+
+            if matches_latest && matches_query {
+                self.active_search_results.push(item.clone());
+                if self.active_search_results.len() >= VISIBLE_RESULTS_LIMIT {
+                    break;
+                }
+            }
+        }
+
+        self.active_search_cursor = end;
+
+        if self.active_search_results.len() >= VISIBLE_RESULTS_LIMIT
+            || self.active_search_cursor >= self.all_items.len()
+        {
+            if self.latest_only_mode {
+                self.active_search_results.sort_by_key(|item| {
+                    std::cmp::Reverse(if item.modified_unix_secs == UNKNOWN_TS {
+                        i64::MIN
+                    } else {
+                        item.modified_unix_secs
+                    })
+                });
+            }
+            self.items = std::mem::take(&mut self.active_search_results);
+            self.active_search_query = None;
+            self.active_search_cursor = 0;
+            self.clamp_selected();
+        }
+    }
+
+    fn clamp_selected(&mut self) {
         if self.items.is_empty() {
             self.selected = 0;
         } else {
@@ -2044,111 +3177,101 @@ impl App {
         }
     }
 
-    fn apply_index_delta(&mut self, upserts: Vec<SearchItem>, deleted_paths: Vec<String>) {
+    fn apply_index_delta(
+        &mut self,
+        upserts: Vec<SearchItem>,
+        deleted_paths: Vec<String>,
+    ) -> (usize, usize, usize) {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let mut deleted_count = 0usize;
         if !deleted_paths.is_empty() {
             let delete_set: std::collections::HashSet<String> = deleted_paths.into_iter().collect();
+            if self.tracking_enabled {
+                deleted_count = delete_set.len();
+                for path in &delete_set {
+                    self.recent_event_by_path.remove(path.as_str());
+                }
+            }
             self.all_items
-                .retain(|item| !delete_set.contains(&item.path));
+                .retain(|item| !delete_set.contains(item.path.as_ref()));
         }
 
+        let mut added_count = 0usize;
+        let mut updated_count = 0usize;
         for upsert in upserts {
+            if self.tracking_enabled {
+                let event_ts = if upsert.modified_unix_secs == UNKNOWN_TS {
+                    now_unix
+                } else {
+                    upsert.modified_unix_secs
+                };
+                self.recent_event_by_path
+                    .insert(upsert.path.clone(), event_ts);
+            }
             if let Some(existing) = self
                 .all_items
                 .iter_mut()
                 .find(|item| item.path == upsert.path)
             {
                 *existing = upsert;
+                if self.tracking_enabled {
+                    updated_count += 1;
+                }
             } else {
                 self.all_items.push(upsert);
+                if self.tracking_enabled {
+                    added_count += 1;
+                }
             }
         }
 
-        self.refresh_results();
+        self.needs_search_refresh = true;
+        self.filename_index_dirty = true;
+        self.filename_index_building = false;
+        self.filename_index_build_cursor = 0;
+        (added_count, updated_count, deleted_count)
     }
 }
 
-fn query_matches_item(query: &str, item: &SearchItem) -> bool {
-    if query.contains('*') || query.contains('?') {
-        let name = item.name.to_ascii_lowercase();
-        let path = item.path.to_ascii_lowercase();
-        wildcard_match(query, &name) || wildcard_match(query, &path)
+fn estimate_index_memory_bytes(items: &[SearchItem]) -> usize {
+    let mut total = std::mem::size_of_val(items);
+    for item in items {
+        total += std::mem::size_of::<SearchItem>();
+        total += item.path.len();
+    }
+    total
+}
+
+fn format_bytes(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
     } else {
-        item.name.to_ascii_lowercase().contains(query)
-            || item.path.to_ascii_lowercase().contains(query)
+        format!("{} B", bytes)
     }
 }
 
-fn truncate_middle(input: &str, max_chars: usize) -> String {
-    let len = input.chars().count();
-    if len <= max_chars {
-        return input.to_string();
+#[cfg(target_os = "windows")]
+fn filetime_100ns_to_unix_secs(filetime_100ns: i64) -> Option<i64> {
+    if filetime_100ns <= 0 {
+        return None;
     }
 
-    if max_chars <= 3 {
-        return "...".to_string();
-    }
-
-    let left = (max_chars - 3) / 2;
-    let right = max_chars - 3 - left;
-    let start: String = input.chars().take(left).collect();
-    let mut end_chars: Vec<char> = input.chars().rev().take(right).collect();
-    end_chars.reverse();
-    let end: String = end_chars.into_iter().collect();
-    format!("{}...{}", start, end)
-}
-
-fn file_type_color(name: &str) -> Color {
-    let ext = std::path::Path::new(name)
-        .extension()
-        .and_then(|v| v.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    match ext.as_str() {
-        "rs" | "toml" | "json" | "yaml" | "yml" | "xml" | "ini" | "md" | "txt" => {
-            Color::from_rgb8(110, 198, 255)
-        }
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" => {
-            Color::from_rgb8(136, 209, 141)
-        }
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" => Color::from_rgb8(244, 183, 109),
-        "mp4" | "mkv" | "avi" | "mov" | "wmv" => Color::from_rgb8(202, 166, 255),
-        "zip" | "7z" | "rar" | "tar" | "gz" => Color::from_rgb8(220, 158, 116),
-        "exe" | "msi" | "bat" | "cmd" | "ps1" => Color::from_rgb8(255, 128, 128),
-        _ => Color::from_rgb8(220, 224, 230),
-    }
-}
-
-fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let p = pattern.as_bytes();
-    let t = text.as_bytes();
-
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let mut star_idx: Option<usize> = None;
-    let mut match_idx = 0usize;
-
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == t[ti] || p[pi] == b'?') {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
-            star_idx = Some(pi);
-            match_idx = ti;
-            pi += 1;
-        } else if let Some(star) = star_idx {
-            pi = star + 1;
-            match_idx += 1;
-            ti = match_idx;
-        } else {
-            return false;
-        }
-    }
-
-    while pi < p.len() && p[pi] == b'*' {
-        pi += 1;
-    }
-
-    pi == p.len()
+    let windows_epoch_to_unix_secs = 11_644_473_600i64;
+    let secs = filetime_100ns / 10_000_000 - windows_epoch_to_unix_secs;
+    Some(secs)
 }
 
 fn sync_results_scroll(scroll_id: widget::Id, selected: usize, total: usize) -> Task<Message> {
@@ -2160,16 +3283,49 @@ fn sync_results_scroll(scroll_id: widget::Id, selected: usize, total: usize) -> 
     operation::snap_to(scroll_id, widget::scrollable::RelativeOffset { x: 0.0, y })
 }
 
-fn run_index_job(scope: SearchScope, job_id: u64, tx: mpsc::Sender<IndexEvent>) {
+fn run_index_job(
+    scope: SearchScope,
+    job_id: u64,
+    tx: mpsc::Sender<IndexEvent>,
+    allow_dirwalk_fallback: bool,
+) {
+    debug_log(&format!(
+        "run_index_job start job_id={} scope={}",
+        job_id,
+        scope.label()
+    ));
     #[cfg(target_os = "windows")]
     {
         if run_ntfs_live_index_job(scope.clone(), job_id, &tx) {
+            debug_log(&format!(
+                "run_index_job live index active job_id={} scope={}",
+                job_id,
+                scope.label()
+            ));
             return;
         }
+
+        debug_log(&format!(
+            "run_index_job live index unavailable job_id={} scope={}",
+            job_id,
+            scope.label()
+        ));
     }
 
-    let items = index_files_for_scope_with_progress(scope, job_id, &tx);
-    let _ = tx.send(IndexEvent::Done { job_id, items });
+    let (items, backend) =
+        index_files_for_scope_with_progress(scope.clone(), job_id, &tx, allow_dirwalk_fallback);
+    persist_scope_snapshot_async(scope.clone(), items.clone());
+    debug_log(&format!(
+        "run_index_job finished job_id={} items={} backend={}",
+        job_id,
+        items.len(),
+        backend.label()
+    ));
+    let _ = tx.send(IndexEvent::Done {
+        job_id,
+        items,
+        backend,
+    });
 }
 
 fn init_hotkey() -> Result<(Option<GlobalHotKeyManager>, Option<HotKey>), String> {

@@ -4,13 +4,13 @@ Tray-resident, keyboard-first Windows file finder inspired by WizFile, optimized
 
 ## Current status
 
-Initial monorepo scaffold with:
+Working native prototype with:
 
-- Native Rust desktop shell using Iced (no web stack)
-- Tray icon + global hotkey (default backtick) wiring
-- TUI-like panel skeleton with keyboard navigation
-- Rust core crates split by responsibility
-- IPC contract and v1 architecture docs
+- Native Rust desktop app using Iced (no web stack)
+- Tray icon + global hotkey (default backtick) show/hide flow
+- Scope-aware indexing (NTFS live path on Windows, dirwalk fallback when not elevated)
+- Debounced, wildcard-capable search UI with keyboard-first navigation
+- Slash-command workflow for scope, elevation, tracking toggle, recent-changes filtering, and reindexing
 
 ## Stack
 
@@ -56,17 +56,27 @@ cargo run -p wizmini-native
 - App runs as a native windowed process with tray icon.
 - Global hotkey default is backtick (`) to show/hide panel.
 - Tray menu supports `Show/Hide` and `Quit`.
-- Search box filters indexed files from the active scope (NTFS volume indexing for drive scopes on Windows; directory walk fallback for non-drive paths).
+- Search box filters indexed files from the active scope (NTFS volume indexing for drive scopes on Windows; directory walk fallback in non-elevated mode).
 - Wildcards are supported in search: `*` (any sequence) and `?` (single character), e.g. `sraz*`.
+- Search execution is debounced so typing stays responsive.
+- While typing is active, in-flight searches are cancelled and no new search starts until input settles.
+- Filename lookups use an in-memory accelerator (exact + short-prefix index) for faster filename queries.
+- Search input is intentionally disabled while indexing progress is active.
 - Keyboard controls: `ArrowUp/ArrowDown` select, `Enter` select/open, `Alt+Enter` reveal, `Esc` hide.
 - Results list follows keyboard selection scrolling; file names are colorized by type, and long paths are middle-truncated with `...`.
 - Panel width is dynamic (about half the screen width, clamped), and `/exit` is highlighted in bold red in command suggestions.
+- Status line shows current scope, memory estimate for the in-memory index, and live delta counters (`+added ~updated -deleted`).
 
 ## Slash commands
 
 - `/entire` - set scope to the entire current drive (persists across restarts)
 - `/all` - set scope to all local drives (persists across restarts)
 - `/x:` - set scope to a specific drive (example: `/d:`), persists across restarts
+- `/up` - relaunch app elevated (Windows UAC prompt)
+- `/track` - toggle live event tracking on/off
+- `/latest [window]` - show files changed recently from USN timestamps (default `5m`; examples: `/latest 30sec`, `/latest 1m`, `/latest 3h`)
+- `/last [window]` - alias of `/latest`
+- `/reindex` - force reindex of current scope
 - `/testProgress` - visual progress bar test only (no indexing)
 - `/exit` - exit the app immediately
 
@@ -75,10 +85,14 @@ Behavior notes:
 - Type `/` to open command suggestions.
 - Use `ArrowUp/ArrowDown` to select a command and `Enter` to apply it.
 - If `/` is removed, arrow keys return to normal file-result navigation.
-- `/exit` runs as soon as it is typed.
+- Unknown slash commands do not open files.
+- `/latest` and `/last` are available only when tracking is enabled.
 
 ## Notes
 
 - NTFS MFT-based volume enumeration is used for drive scopes on Windows.
 - NTFS USN journal replay keeps drive-scope index data updated after initial load.
-- Drive-scope NTFS index snapshots + USN checkpoints are persisted under `%LOCALAPPDATA%\WizMini` for faster warm starts and incremental catch-up.
+- USN checkpoints and debug logs are persisted under `%LOCALAPPDATA%\WizMini`.
+- Scope index snapshots are persisted in binary format (`.bin`) under `%LOCALAPPDATA%\WizMini\snapshots`.
+- The in-memory file list is optimized for memory pressure by storing path-first entries and deriving display filename from path.
+- Command/query helpers are split into `apps/native/src/commands.rs` and `apps/native/src/search.rs`.
