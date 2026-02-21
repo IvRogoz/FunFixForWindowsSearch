@@ -24,10 +24,12 @@ use iced::alignment::Horizontal;
 use iced::keyboard::{key, Event as KeyboardEvent, Key};
 use iced::widget::operation;
 use iced::widget::{
-    self, column, container, progress_bar, row, scrollable, stack, text, text_input,
+    self, button, column, container, progress_bar, row, scrollable, stack, text, text_input,
 };
 use iced::window;
-use iced::{Alignment, Color, Element, Fill, Font, Length, Point, Size, Subscription, Task, Theme};
+use iced::{
+    Alignment, Color, Element, Fill, Font, Length, Padding, Point, Size, Subscription, Task, Theme,
+};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use walkdir::WalkDir;
@@ -81,6 +83,9 @@ const FILE_PATH_MAX_CHARS: usize = 86;
 const MAX_INDEX_EVENTS_PER_TICK: usize = 16;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const UNKNOWN_TS: i64 = i64::MIN;
+const KEYBOARD_PAGE_JUMP: usize = 12;
+const CONSOLAS_REGULAR: &[u8] = include_bytes!("../assets/fonts/consola.ttf");
+const CONSOLAS_BOLD: &[u8] = include_bytes!("../assets/fonts/consolab.ttf");
 
 static DEBUG_LOG_FILES: OnceLock<std::sync::Mutex<Vec<std::fs::File>>> = OnceLock::new();
 static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -97,11 +102,12 @@ fn main() -> iced::Result {
     iced::application(
         move || {
             let app = App::default();
+            let should_start_visible = start_visible || app.show_quick_help_overlay;
             let initial_scope = app.scope.clone();
 
             let mut tasks = vec![Task::done(Message::StartIndex(initial_scope))];
 
-            if start_visible {
+            if should_start_visible {
                 tasks.push(prepare_panel_for_show_mode());
                 tasks.push(sync_window_to_progress(1.0));
                 tasks.push(operation::focus(app.search_input_id.clone()));
@@ -111,7 +117,7 @@ fn main() -> iced::Result {
             }
 
             let mut app = app;
-            if start_visible {
+            if should_start_visible {
                 app.panel_visible = true;
                 app.panel_progress = 1.0;
             }
@@ -122,6 +128,9 @@ fn main() -> iced::Result {
         view,
     )
     .title("WizMini")
+    .font(CONSOLAS_REGULAR)
+    .font(CONSOLAS_BOLD)
+    .default_font(Font::with_name("Consolas"))
     .theme(theme)
     .window(native_window_settings())
     .subscription(subscription)
@@ -213,6 +222,8 @@ enum Message {
     AnimateFrame,
     Keyboard(KeyboardEvent),
     StartIndex(SearchScope),
+    CloseQuickHelp,
+    CloseQuickHelpForever,
 }
 
 #[derive(Debug, Clone)]
@@ -355,6 +366,32 @@ fn scope_config_path() -> std::path::PathBuf {
         .join("scope.txt")
 }
 
+fn quick_help_config_path() -> std::path::PathBuf {
+    let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(base)
+        .join("WizMini")
+        .join("quick-help-dismissed.txt")
+}
+
+fn load_quick_help_dismissed() -> bool {
+    let Ok(content) = std::fs::read_to_string(quick_help_config_path()) else {
+        return false;
+    };
+
+    content.trim().eq_ignore_ascii_case("1")
+}
+
+fn persist_quick_help_dismissed(value: bool) {
+    let path = quick_help_config_path();
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+
+    let _ = std::fs::write(path, if value { "1" } else { "0" });
+}
+
 fn scope_snapshot_path(scope: &SearchScope) -> std::path::PathBuf {
     let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
     std::path::PathBuf::from(base)
@@ -441,9 +478,12 @@ struct App {
     index_backend: IndexBackend,
     index_memory_bytes: usize,
     visual_progress_test_active: bool,
+    indexing_is_refresh: bool,
     is_elevated: bool,
     use_dirwalk_fallback: bool,
     show_privilege_overlay: bool,
+    show_quick_help_overlay: bool,
+    quick_help_selected_action: usize,
     pending_query: Option<(String, Instant, u64)>,
     query_edit_counter: u64,
     active_search_query: Option<String>,
@@ -521,9 +561,12 @@ impl Default for App {
             index_backend: IndexBackend::Detecting,
             index_memory_bytes: 0,
             visual_progress_test_active: false,
+            indexing_is_refresh: false,
             is_elevated,
             use_dirwalk_fallback: !is_elevated,
             show_privilege_overlay: !is_elevated,
+            show_quick_help_overlay: !load_quick_help_dismissed(),
+            quick_help_selected_action: 0,
             pending_query: None,
             query_edit_counter: 0,
             active_search_query: None,
@@ -557,6 +600,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::QueryChanged(query) => {
             if app.show_privilege_overlay {
                 app.show_privilege_overlay = false;
+            }
+            if app.show_quick_help_overlay {
+                app.show_quick_help_overlay = false;
             }
 
             app.raw_query = query;
@@ -919,11 +965,35 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 
                 match key.as_ref() {
                     Key::Named(key::Named::Escape) => {
+                        if app.show_quick_help_overlay {
+                            app.show_quick_help_overlay = false;
+                            return Task::none();
+                        }
                         app.panel_visible = false;
                         app.panel_anim_last_tick = None;
                         return Task::none();
                     }
+                    Key::Named(key::Named::Tab)
+                    | Key::Named(key::Named::ArrowLeft)
+                    | Key::Named(key::Named::ArrowRight) => {
+                        if app.show_quick_help_overlay {
+                            app.quick_help_selected_action =
+                                (app.quick_help_selected_action + 1) % 2;
+                            return Task::none();
+                        }
+                    }
+                    Key::Character("d") | Key::Character("D") => {
+                        if app.show_quick_help_overlay {
+                            app.show_quick_help_overlay = false;
+                            persist_quick_help_dismissed(true);
+                            return Task::none();
+                        }
+                    }
                     Key::Named(key::Named::ArrowDown) => {
+                        if app.show_quick_help_overlay {
+                            app.quick_help_selected_action = 1;
+                            return Task::none();
+                        }
                         if command_mode {
                             app.command_selected =
                                 (app.command_selected + 1).min(suggestions.len() - 1);
@@ -937,6 +1007,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         }
                     }
                     Key::Named(key::Named::ArrowUp) => {
+                        if app.show_quick_help_overlay {
+                            app.quick_help_selected_action = 0;
+                            return Task::none();
+                        }
                         if command_mode {
                             app.command_selected = app.command_selected.saturating_sub(1);
                         } else if !app.items.is_empty() {
@@ -948,22 +1022,102 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                             );
                         }
                     }
+                    Key::Named(key::Named::PageDown) => {
+                        if command_mode {
+                            app.command_selected = (app.command_selected + KEYBOARD_PAGE_JUMP)
+                                .min(suggestions.len() - 1);
+                        } else if !app.items.is_empty() {
+                            app.selected =
+                                (app.selected + KEYBOARD_PAGE_JUMP).min(app.items.len() - 1);
+                            return sync_results_scroll(
+                                app.results_scroll_id.clone(),
+                                app.selected,
+                                app.items.len(),
+                            );
+                        }
+                    }
+                    Key::Named(key::Named::PageUp) => {
+                        if command_mode {
+                            app.command_selected =
+                                app.command_selected.saturating_sub(KEYBOARD_PAGE_JUMP);
+                        } else if !app.items.is_empty() {
+                            app.selected = app.selected.saturating_sub(KEYBOARD_PAGE_JUMP);
+                            return sync_results_scroll(
+                                app.results_scroll_id.clone(),
+                                app.selected,
+                                app.items.len(),
+                            );
+                        }
+                    }
+                    Key::Named(key::Named::Home) => {
+                        if command_mode {
+                            app.command_selected = 0;
+                        } else if !app.items.is_empty() {
+                            app.selected = 0;
+                            return sync_results_scroll(
+                                app.results_scroll_id.clone(),
+                                app.selected,
+                                app.items.len(),
+                            );
+                        }
+                    }
+                    Key::Named(key::Named::End) => {
+                        if command_mode {
+                            app.command_selected = suggestions.len() - 1;
+                        } else if !app.items.is_empty() {
+                            app.selected = app.items.len() - 1;
+                            return sync_results_scroll(
+                                app.results_scroll_id.clone(),
+                                app.selected,
+                                app.items.len(),
+                            );
+                        }
+                    }
                     Key::Named(key::Named::Enter) if modifiers.alt() && !command_mode => {
+                        if app.show_quick_help_overlay {
+                            return Task::none();
+                        }
                         if let Some(item) = app.items.get(app.selected) {
                             app.last_action = format!("Reveal: {}", item.path);
                             let _ = reveal_path(item.path.as_ref());
                         }
                     }
                     Key::Named(key::Named::Enter) if command_mode => {
+                        if app.show_quick_help_overlay {
+                            if app.quick_help_selected_action == 0 {
+                                app.show_quick_help_overlay = false;
+                            } else {
+                                app.show_quick_help_overlay = false;
+                                persist_quick_help_dismissed(true);
+                            }
+                            return Task::none();
+                        }
                         return Task::done(Message::ActivateSelected);
                     }
-                    Key::Named(key::Named::Enter) => {}
+                    Key::Named(key::Named::Enter) => {
+                        if app.show_quick_help_overlay {
+                            if app.quick_help_selected_action == 0 {
+                                app.show_quick_help_overlay = false;
+                            } else {
+                                app.show_quick_help_overlay = false;
+                                persist_quick_help_dismissed(true);
+                            }
+                            return Task::none();
+                        }
+                    }
                     _ => {}
                 }
             }
         }
         Message::StartIndex(scope) => {
             app.begin_index(scope);
+        }
+        Message::CloseQuickHelp => {
+            app.show_quick_help_overlay = false;
+        }
+        Message::CloseQuickHelpForever => {
+            app.show_quick_help_overlay = false;
+            persist_quick_help_dismissed(true);
         }
     }
 
@@ -995,13 +1149,41 @@ fn view(app: &App) -> Element<'_, Message> {
 
     let mut listed = column![];
     for (index, item) in app.items.iter().enumerate() {
-        let marker = if index == app.selected { ">" } else { " " };
+        let is_selected = index == app.selected;
+        let marker = container(
+            text(if is_selected { "▶" } else { " " })
+                .size(18)
+                .line_height(1.0)
+                .align_y(iced::alignment::Vertical::Center)
+                .color(if is_selected {
+                    Color::from_rgb8(255, 213, 128)
+                } else {
+                    Color::from_rgb8(100, 105, 112)
+                })
+                .font(Font {
+                    weight: if is_selected {
+                        iced::font::Weight::Bold
+                    } else {
+                        iced::font::Weight::Normal
+                    },
+                    ..Font::with_name("Segoe UI Symbol")
+                }),
+        )
+        .width(Length::Fixed(18.0))
+        .height(Length::Fill)
+        .padding(Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 7.0,
+            left: 0.0,
+        })
+        .center_y(Fill);
         let display_path = truncate_middle(item.path.as_ref(), FILE_PATH_MAX_CHARS);
         let item_name = file_name_from_path(item.path.as_ref());
         let name_color = file_type_color(item_name);
         listed = listed.push(
             row![
-                text(marker),
+                marker,
                 text(item_name)
                     .color(name_color)
                     .size(FILE_NAME_FONT_SIZE)
@@ -1011,6 +1193,7 @@ fn view(app: &App) -> Element<'_, Message> {
                     .width(Length::FillPortion(5))
                     .size(FILE_PATH_FONT_SIZE)
             ]
+            .align_y(Alignment::Center)
             .spacing(8)
             .padding(6),
         );
@@ -1019,11 +1202,35 @@ fn view(app: &App) -> Element<'_, Message> {
     let command_items = command_menu_items(&app.raw_query, app.tracking_enabled);
     let mut command_dropdown = column![];
     for (index, item) in command_items.iter().enumerate() {
-        let marker = if index == app.command_selected {
-            ">"
-        } else {
-            " "
-        };
+        let is_selected = index == app.command_selected;
+        let marker = container(
+            text(if is_selected { "▶" } else { " " })
+                .size(18)
+                .line_height(1.0)
+                .align_y(iced::alignment::Vertical::Center)
+                .color(if is_selected {
+                    Color::from_rgb8(255, 213, 128)
+                } else {
+                    Color::from_rgb8(100, 105, 112)
+                })
+                .font(Font {
+                    weight: if is_selected {
+                        iced::font::Weight::Bold
+                    } else {
+                        iced::font::Weight::Normal
+                    },
+                    ..Font::with_name("Segoe UI Symbol")
+                }),
+        )
+        .width(Length::Fixed(18.0))
+        .height(Length::Fill)
+        .padding(Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 7.0,
+            left: 0.0,
+        })
+        .center_y(Fill);
 
         let mut command_text = text(item.command).width(Length::Fixed(120.0));
         if item.command.eq_ignore_ascii_case("/exit") {
@@ -1036,47 +1243,66 @@ fn view(app: &App) -> Element<'_, Message> {
         }
 
         command_dropdown = command_dropdown.push(
-            row![text(marker), command_text, text(item.description).size(13)]
+            row![marker, command_text, text(item.description).size(13)]
+                .align_y(Alignment::Center)
                 .spacing(8)
                 .padding(4),
         );
     }
 
     let command_dropdown = if command_items.is_empty() {
-        container(column![]).height(Length::Shrink)
+        None
     } else {
-        container(command_dropdown)
-            .padding(6)
-            .style(container::bordered_box)
-            .width(Fill)
-            .height(Length::Shrink)
+        Some(
+            container(command_dropdown)
+                .padding(6)
+                .style(container::bordered_box)
+                .width(Fill)
+                .height(Length::Shrink),
+        )
     };
 
     let index_progress = if app.indexing_in_progress {
-        container(
-            column![
-                text(format!(
-                    "{} {} ... {:.0}%",
-                    if app.indexing_phase == "write" {
-                        "Building index map"
-                    } else {
-                        "Indexing"
-                    },
-                    app.scope.label(),
-                    app.indexing_progress * 100.0
-                ))
-                .size(13),
-                progress_bar(0.0..=1.0, app.indexing_progress)
-            ]
-            .spacing(4),
+        Some(
+            container(
+                column![
+                    text(format!(
+                        "{} {} ... {:.0}%",
+                        if app.indexing_phase == "write" {
+                            if app.indexing_is_refresh {
+                                "Updating index map"
+                            } else {
+                                "Building index map"
+                            }
+                        } else if app.indexing_is_refresh {
+                            "Updating index"
+                        } else {
+                            "Building full index"
+                        },
+                        app.scope.label(),
+                        app.indexing_progress * 100.0
+                    ))
+                    .size(13),
+                    progress_bar(0.0..=1.0, app.indexing_progress)
+                ]
+                .spacing(4),
+            )
+            .padding(6)
+            .style(container::bordered_box)
+            .width(Fill)
+            .height(Length::Shrink),
         )
-        .padding(6)
-        .style(container::bordered_box)
-        .width(Fill)
-        .height(Length::Shrink)
     } else {
-        container(column![]).height(Length::Shrink)
+        None
     };
+
+    let mut top_stack = column![prompt].spacing(6);
+    if let Some(dropdown) = command_dropdown {
+        top_stack = top_stack.push(dropdown);
+    }
+    if let Some(progress) = index_progress {
+        top_stack = top_stack.push(progress);
+    }
 
     let base_list = scrollable(listed)
         .id(app.results_scroll_id.clone())
@@ -1121,9 +1347,7 @@ fn view(app: &App) -> Element<'_, Message> {
     };
 
     let content = column![
-        prompt,
-        command_dropdown,
-        index_progress,
+        top_stack,
         text(format!(
             "SCOPE: {}{} | MEM: {} | CHG: +{} ~{} -{} | SORT: relevance | RESULTS: {} | LAST: {}",
             app.scope.label(),
@@ -1202,11 +1426,61 @@ fn view(app: &App) -> Element<'_, Message> {
     .spacing(10)
     .padding(12);
 
-    container(content)
+    let main_panel = container(content)
         .width(Fill)
         .height(Length::Fixed(PANEL_HEIGHT))
-        .style(container::rounded_box)
+        .style(container::rounded_box);
+
+    if app.show_quick_help_overlay {
+        stack![
+            main_panel,
+            container(
+                container(
+                    column![
+                        text("Quick Start").size(24),
+                        text("Press ` to show or hide WizMini. Type to search immediately. Use Arrow Up and Arrow Down to move. Press Enter to open. Press Alt+Enter to reveal in Explorer. Press Esc to hide the panel. Type / to open commands like /all, /entire, /reindex, /track, and /exit.")
+                            .size(15),
+                        row![
+                            button(text("Close"))
+                                .on_press(Message::CloseQuickHelp)
+                                .style(if app.quick_help_selected_action == 0 {
+                                    button::primary
+                                } else {
+                                    button::secondary
+                                })
+                                .padding([6, 12]),
+                            button(text("Don't show again"))
+                                .on_press(Message::CloseQuickHelpForever)
+                                .style(if app.quick_help_selected_action == 1 {
+                                    button::primary
+                                } else {
+                                    button::secondary
+                                })
+                                .padding([6, 12])
+                        ]
+                        .spacing(10),
+                        text("Tab to switch. Enter to confirm. D = don't show again. Esc = close once.")
+                            .size(12)
+                    ]
+                    .spacing(12),
+                )
+                .padding(14)
+                .width(Length::Fixed(620.0))
+                .style(container::bordered_box)
+                .center_x(Fill)
+                .center_y(Fill),
+            )
+            .width(Fill)
+            .height(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(Color::from_rgba8(8, 10, 14, 0.65).into()),
+                ..container::Style::default()
+            })
+        ]
         .into()
+    } else {
+        main_panel.into()
+    }
 }
 
 fn theme(_app: &App) -> Theme {
@@ -2892,6 +3166,7 @@ impl App {
         self.indexing_in_progress = true;
         self.indexing_progress = 0.0;
         self.indexing_phase = "index";
+        self.indexing_is_refresh = false;
         self.index_backend = IndexBackend::Detecting;
         self.index_memory_bytes = 0;
         self.filename_index_dirty = true;
@@ -2905,6 +3180,7 @@ impl App {
 
         if let Some(items) = load_scope_snapshot(&scope) {
             self.all_items = items;
+            self.indexing_is_refresh = true;
             self.recompute_index_memory_bytes();
             self.schedule_search_from_current_query();
             self.last_action = format!(

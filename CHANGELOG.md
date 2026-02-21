@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## 2026-02-21
+
+### Added
+- Added first-run Quick Start overlay with practical keyboard guidance and command examples.
+- Added persistent `Don't show again` preference for Quick Start (`%LOCALAPPDATA%\\WizMini\\quick-help-dismissed.txt`).
+- Added keyboard paging/navigation handlers for results and command lists: `PageUp`, `PageDown`, `Home`, and `End`.
+- Added bundled Consolas font assets for consistent app typography (`apps/native/assets/fonts/consola.ttf`, `consolab.ttf`).
+
+### Changed
+- Changed selection indicator from plain `>` to a larger, high-contrast arrow marker for better visibility.
+- Changed marker rendering to use symbol-friendly font settings and vertical nudge alignment for clearer row targeting.
+- Changed indexing progress copy to distinguish refresh behavior from full rebuild behavior (`Updating index` vs `Building full index`).
+- Changed startup behavior to open the panel automatically when Quick Start is visible.
+- Changed top-layout composition to remove empty spacer containers and tighten spacing under the search input.
+
+### Fixed
+- Fixed Quick Start interaction flow by adding keyboard-first action selection and confirmation logic.
+- Fixed an excessive visual gap between the search prompt and status region when command/index panels are hidden.
+
 ## 2026-02-20
 
 ### Added
