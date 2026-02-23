@@ -24,9 +24,19 @@ pub(crate) fn contains_ascii_case_insensitive(haystack: &str, needle_lower_ascii
         return false;
     }
 
+    if n.len() == 1 {
+        let b = n[0];
+        return h.iter().any(|ch| ch.to_ascii_lowercase() == b);
+    }
+
+    let first = n[0];
     for start in 0..=h.len() - n.len() {
+        if h[start].to_ascii_lowercase() != first {
+            continue;
+        }
+
         let mut ok = true;
-        for i in 0..n.len() {
+        for i in 1..n.len() {
             if h[start + i].to_ascii_lowercase() != n[i] {
                 ok = false;
                 break;

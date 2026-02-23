@@ -34,6 +34,17 @@ Output binary:
 
 `target/release/wizmini-native.exe`
 
+## Architecture
+
+- `apps/native/src/main.rs`: app bootstrap and shared state definitions.
+- `apps/native/src/update.rs`: message/update loop and keyboard/event routing.
+- `apps/native/src/ui.rs`: panel rendering, overlays, and progress UI.
+- `apps/native/src/windowing.rs`: window animation/position/focus helpers.
+- `apps/native/src/indexing.rs`: scope indexing orchestration and walkdir fallback.
+- `apps/native/src/indexing_ntfs.rs`: NTFS/USN live indexing pipeline (Windows).
+- `apps/native/src/search_worker.rs`: background search worker with cancellation/progress events.
+- `apps/native/src/storage.rs`: persisted scope/help settings and snapshot I/O.
+
 ## Basic usage
 
 - Press `` ` `` to show/hide panel

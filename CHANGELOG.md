@@ -7,11 +7,18 @@ All notable changes to this project are documented in this file.
 ### Changed
 - Increased selected-row contrast in both search results and command suggestions with a stronger background and border.
 - Updated selected-row border shape to square corners for a sharper terminal-like look.
+- Refactored native app structure by splitting large `main.rs` responsibilities into focused modules: `ui`, `update`, `windowing`, `indexing`, `indexing_ntfs`, `search_worker`, and `storage`.
+- Moved search execution to a dedicated worker thread with explicit cancellation and progress events to keep UI event handling responsive.
+- Added non-blocking search progress display using the same progress panel style used for indexing phases.
 
 ### Fixed
 - Fixed Quick Start Enter behavior so Enter confirms the selected Quick Start action instead of opening files behind the overlay.
 - Fixed keyboard navigation focus drift so typing `/` still works immediately after Arrow/Page/Home/End navigation.
 - Fixed non-elevated warning overlay dismissal so it now hides on any key press (including arrow keys).
+- Fixed startup responsiveness regression by removing blocking snapshot restore from initial UI render path.
+- Fixed search input focus restoration after Quick Start close actions and after index completion when panel is visible.
+- Fixed repeated search restarts during live indexing by removing immediate delta-triggered re-search and relying on coalesced refresh conditions.
+- Fixed unexpected background searches by limiting automatic refresh scheduling to empty-query or latest-only modes.
 
 ## 2026-02-21
 
