@@ -647,7 +647,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     persist_quick_help_dismissed(true);
                 }
 
-                return Task::none();
+                return keep_search_input_focus(app.search_input_id.clone());
             }
 
             let suggestions = command_menu_items(&app.raw_query, app.tracking_enabled);
@@ -1165,10 +1165,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::CloseQuickHelp => {
             app.show_quick_help_overlay = false;
+            return keep_search_input_focus(app.search_input_id.clone());
         }
         Message::CloseQuickHelpForever => {
             app.show_quick_help_overlay = false;
             persist_quick_help_dismissed(true);
+            return keep_search_input_focus(app.search_input_id.clone());
         }
     }
 
