@@ -4,8 +4,6 @@ WizMini is a native, keyboard-first Windows file finder. It runs in the tray, op
 
 ![WizMini demo](app.gif)
 
-For the long-form architecture write-up, rationale, and deep technical explanation, see `post.md`.
-
 ## Requirements
 
 - Rust toolchain (`rustup`, `cargo`, `rustc`)
