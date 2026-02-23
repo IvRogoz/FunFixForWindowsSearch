@@ -45,6 +45,11 @@ Output binary:
 - `Esc` hide panel
 - Type `/` for command mode
 
+### Overlay behavior
+
+- When Quick Start is visible, `Enter` confirms the selected action (`Close` or `Don't show again`).
+- Non-elevated warning overlay dismisses on any key press.
+
 ## Slash commands
 
 - `/entire` scope to current drive

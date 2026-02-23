@@ -315,6 +315,18 @@ fn state_status_color(indexing_in_progress: bool) -> Color {
     }
 }
 
+fn selected_row_style() -> container::Style {
+    container::Style {
+        background: Some(Color::from_rgb8(58, 84, 122).into()),
+        border: iced::Border {
+            color: Color::from_rgb8(255, 213, 128),
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 impl SearchScope {
     fn label(&self) -> String {
         match self {
@@ -627,6 +639,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             return Task::none();
         }
         Message::ActivateSelected => {
+            if app.show_quick_help_overlay {
+                if app.quick_help_selected_action == 0 {
+                    app.show_quick_help_overlay = false;
+                } else {
+                    app.show_quick_help_overlay = false;
+                    persist_quick_help_dismissed(true);
+                }
+
+                return Task::none();
+            }
+
             let suggestions = command_menu_items(&app.raw_query, app.tracking_enabled);
             let first_token = app
                 .raw_query
@@ -960,6 +983,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
 
             if let KeyboardEvent::KeyPressed { key, modifiers, .. } = event {
+                if app.show_privilege_overlay {
+                    app.show_privilege_overlay = false;
+                }
+
                 let suggestions = command_menu_items(&app.raw_query, app.tracking_enabled);
                 let command_mode = !suggestions.is_empty();
 
@@ -997,13 +1024,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         if command_mode {
                             app.command_selected =
                                 (app.command_selected + 1).min(suggestions.len() - 1);
+                            return keep_search_input_focus(app.search_input_id.clone());
                         } else if !app.items.is_empty() {
                             app.selected = (app.selected + 1).min(app.items.len() - 1);
-                            return sync_results_scroll(
-                                app.results_scroll_id.clone(),
-                                app.selected,
-                                app.items.len(),
-                            );
+                            return Task::batch(vec![
+                                sync_results_scroll(
+                                    app.results_scroll_id.clone(),
+                                    app.selected,
+                                    app.items.len(),
+                                ),
+                                keep_search_input_focus(app.search_input_id.clone()),
+                            ]);
                         }
                     }
                     Key::Named(key::Named::ArrowUp) => {
@@ -1013,64 +1044,84 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         }
                         if command_mode {
                             app.command_selected = app.command_selected.saturating_sub(1);
+                            return keep_search_input_focus(app.search_input_id.clone());
                         } else if !app.items.is_empty() {
                             app.selected = app.selected.saturating_sub(1);
-                            return sync_results_scroll(
-                                app.results_scroll_id.clone(),
-                                app.selected,
-                                app.items.len(),
-                            );
+                            return Task::batch(vec![
+                                sync_results_scroll(
+                                    app.results_scroll_id.clone(),
+                                    app.selected,
+                                    app.items.len(),
+                                ),
+                                keep_search_input_focus(app.search_input_id.clone()),
+                            ]);
                         }
                     }
                     Key::Named(key::Named::PageDown) => {
                         if command_mode {
                             app.command_selected = (app.command_selected + KEYBOARD_PAGE_JUMP)
                                 .min(suggestions.len() - 1);
+                            return keep_search_input_focus(app.search_input_id.clone());
                         } else if !app.items.is_empty() {
                             app.selected =
                                 (app.selected + KEYBOARD_PAGE_JUMP).min(app.items.len() - 1);
-                            return sync_results_scroll(
-                                app.results_scroll_id.clone(),
-                                app.selected,
-                                app.items.len(),
-                            );
+                            return Task::batch(vec![
+                                sync_results_scroll(
+                                    app.results_scroll_id.clone(),
+                                    app.selected,
+                                    app.items.len(),
+                                ),
+                                keep_search_input_focus(app.search_input_id.clone()),
+                            ]);
                         }
                     }
                     Key::Named(key::Named::PageUp) => {
                         if command_mode {
                             app.command_selected =
                                 app.command_selected.saturating_sub(KEYBOARD_PAGE_JUMP);
+                            return keep_search_input_focus(app.search_input_id.clone());
                         } else if !app.items.is_empty() {
                             app.selected = app.selected.saturating_sub(KEYBOARD_PAGE_JUMP);
-                            return sync_results_scroll(
-                                app.results_scroll_id.clone(),
-                                app.selected,
-                                app.items.len(),
-                            );
+                            return Task::batch(vec![
+                                sync_results_scroll(
+                                    app.results_scroll_id.clone(),
+                                    app.selected,
+                                    app.items.len(),
+                                ),
+                                keep_search_input_focus(app.search_input_id.clone()),
+                            ]);
                         }
                     }
                     Key::Named(key::Named::Home) => {
                         if command_mode {
                             app.command_selected = 0;
+                            return keep_search_input_focus(app.search_input_id.clone());
                         } else if !app.items.is_empty() {
                             app.selected = 0;
-                            return sync_results_scroll(
-                                app.results_scroll_id.clone(),
-                                app.selected,
-                                app.items.len(),
-                            );
+                            return Task::batch(vec![
+                                sync_results_scroll(
+                                    app.results_scroll_id.clone(),
+                                    app.selected,
+                                    app.items.len(),
+                                ),
+                                keep_search_input_focus(app.search_input_id.clone()),
+                            ]);
                         }
                     }
                     Key::Named(key::Named::End) => {
                         if command_mode {
                             app.command_selected = suggestions.len() - 1;
+                            return keep_search_input_focus(app.search_input_id.clone());
                         } else if !app.items.is_empty() {
                             app.selected = app.items.len() - 1;
-                            return sync_results_scroll(
-                                app.results_scroll_id.clone(),
-                                app.selected,
-                                app.items.len(),
-                            );
+                            return Task::batch(vec![
+                                sync_results_scroll(
+                                    app.results_scroll_id.clone(),
+                                    app.selected,
+                                    app.items.len(),
+                                ),
+                                keep_search_input_focus(app.search_input_id.clone()),
+                            ]);
                         }
                     }
                     Key::Named(key::Named::Enter) if modifiers.alt() && !command_mode => {
@@ -1182,20 +1233,30 @@ fn view(app: &App) -> Element<'_, Message> {
         let item_name = file_name_from_path(item.path.as_ref());
         let name_color = file_type_color(item_name);
         listed = listed.push(
-            row![
-                marker,
-                text(item_name)
-                    .color(name_color)
-                    .size(FILE_NAME_FONT_SIZE)
-                    .width(Length::FillPortion(3)),
-                text(display_path)
-                    .color(Color::from_rgb8(145, 150, 160))
-                    .width(Length::FillPortion(5))
-                    .size(FILE_PATH_FONT_SIZE)
-            ]
-            .align_y(Alignment::Center)
-            .spacing(8)
-            .padding(6),
+            container(
+                row![
+                    marker,
+                    text(item_name)
+                        .color(name_color)
+                        .size(FILE_NAME_FONT_SIZE)
+                        .width(Length::FillPortion(3)),
+                    text(display_path)
+                        .color(Color::from_rgb8(145, 150, 160))
+                        .width(Length::FillPortion(5))
+                        .size(FILE_PATH_FONT_SIZE)
+                ]
+                .align_y(Alignment::Center)
+                .spacing(8)
+                .padding(6),
+            )
+            .width(Fill)
+            .style(move |_theme| {
+                if is_selected {
+                    selected_row_style()
+                } else {
+                    container::Style::default()
+                }
+            }),
         );
     }
 
@@ -1243,10 +1304,20 @@ fn view(app: &App) -> Element<'_, Message> {
         }
 
         command_dropdown = command_dropdown.push(
-            row![marker, command_text, text(item.description).size(13)]
-                .align_y(Alignment::Center)
-                .spacing(8)
-                .padding(4),
+            container(
+                row![marker, command_text, text(item.description).size(13)]
+                    .align_y(Alignment::Center)
+                    .spacing(8)
+                    .padding(4),
+            )
+            .width(Fill)
+            .style(move |_theme| {
+                if is_selected {
+                    selected_row_style()
+                } else {
+                    container::Style::default()
+                }
+            }),
         );
     }
 
@@ -3557,6 +3628,13 @@ fn sync_results_scroll(scroll_id: widget::Id, selected: usize, total: usize) -> 
 
     let y = (selected as f32 / (total.saturating_sub(1)) as f32).clamp(0.0, 1.0);
     operation::snap_to(scroll_id, widget::scrollable::RelativeOffset { x: 0.0, y })
+}
+
+fn keep_search_input_focus(search_input_id: widget::Id) -> Task<Message> {
+    Task::batch(vec![
+        operation::focus(search_input_id.clone()),
+        operation::move_cursor_to_end(search_input_id),
+    ])
 }
 
 fn run_index_job(

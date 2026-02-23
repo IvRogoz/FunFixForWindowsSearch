@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## 2026-02-23
+
+### Changed
+- Increased selected-row contrast in both search results and command suggestions with a stronger background and border.
+- Updated selected-row border shape to square corners for a sharper terminal-like look.
+
+### Fixed
+- Fixed Quick Start Enter behavior so Enter confirms the selected Quick Start action instead of opening files behind the overlay.
+- Fixed keyboard navigation focus drift so typing `/` still works immediately after Arrow/Page/Home/End navigation.
+- Fixed non-elevated warning overlay dismissal so it now hides on any key press (including arrow keys).
+
 ## 2026-02-21
 
 ### Added
