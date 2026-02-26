@@ -9,16 +9,21 @@ All notable changes to this project are documented in this file.
 - Added RustSearch command parity for scope, indexing, and utility directives, including `/entire`, `/all`, `/x:`, `/up`, `/track`, `/latest`, `/last`, `/reindex`, `/testProgress`, `/fullscreen`, `/fullheight`, and `/exit`.
 - Added RustSearch tray + global hotkey integration and startup privilege notice overlay with centered ASCII-art warning presentation.
 - Added RustSearch implementation docs (`RustSearch/README.md`, `RustSearch/REBUILD_PLAN.md`, `RustSearch/IMPLEMENTATION_REPORT.md`).
+- Added GPU-native UI renderer path for RustSearch with runtime mode switching commands (`/gpu`, `/soft`) and renderer telemetry in footer.
+- Added `/about` command and about overlay support for both GPU and soft renderer paths.
 
 ### Changed
 - Changed RustSearch window behavior to use top slide in/out motion, borderless viewport styling, centered width positioning, and visible-by-default startup.
 - Changed RustSearch command menu to render as a true popup overlay (separate background) without pushing results layout.
 - Changed RustSearch progress phase labels to user-facing terms (`reading snapshot`, `reading index`, `finalizing index`, `live updates`, `ready`) and improved progress label contrast.
+- Changed RustSearch prompt/results/progress rendering in GPU mode to use explicit left-aligned text and square-ended progress visualization.
+- Changed RustSearch docs to include renderer selection and renderer command references.
 
 ### Fixed
 - Fixed RustSearch result navigation so selection movement scrolls through off-screen rows.
 - Fixed RustSearch notice overlays to dismiss on first keypress and preserve readable spacing around content.
 - Fixed RustSearch command execution flow so slash-command Enter clears the query prompt while normal search Enter behavior remains unchanged.
+- Fixed page navigation scroll behavior in GPU mode so PageUp/PageDown keeps selected rows visible.
 
 ## 2026-02-23
 

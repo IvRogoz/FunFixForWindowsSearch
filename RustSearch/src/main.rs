@@ -2,6 +2,7 @@
 
 mod app_state;
 mod commands;
+mod gpu_ui;
 mod indexing;
 mod indexing_ntfs;
 mod platform;
@@ -86,7 +87,7 @@ fn main() -> eframe::Result {
 
 struct RustSearchEguiApp {
     runtime: AppState,
-    terminal: Terminal<RataguiBackend<EmbeddedGraphics>>,
+    renderer: Renderer,
     panel_progress: f32,
     panel_anim_last_tick: Option<Instant>,
     window_width: f32,
@@ -94,26 +95,17 @@ struct RustSearchEguiApp {
     fullscreen_enabled: bool,
     fullheight_enabled: bool,
     fullheight_before_fullscreen: bool,
+    last_frame_instant: Instant,
+    frame_time_ema_ms: f32,
 }
 
 impl RustSearchEguiApp {
     fn new(start_visible: bool, startup_scope: Option<SearchScope>, window_width: f32) -> Self {
-        let font_regular = mono_8x13_atlas();
-        let font_italic = mono_8x13_italic_atlas();
-        let font_bold = mono_8x13_bold_atlas();
-        let soft_backend = SoftBackend::<EmbeddedGraphics>::new(
-            160,
-            60,
-            font_regular,
-            Some(font_bold),
-            Some(font_italic),
-        );
-        let backend = RataguiBackend::new("rustsearch", soft_backend);
-        let terminal = Terminal::new(backend).expect("terminal init failed");
+        let renderer = Renderer::from_env();
 
         Self {
             runtime: AppState::new(start_visible, startup_scope),
-            terminal,
+            renderer,
             panel_progress: if start_visible { 1.0 } else { 0.0 },
             panel_anim_last_tick: None,
             window_width,
@@ -121,6 +113,8 @@ impl RustSearchEguiApp {
             fullscreen_enabled: false,
             fullheight_enabled: false,
             fullheight_before_fullscreen: false,
+            last_frame_instant: Instant::now(),
+            frame_time_ema_ms: 0.0,
         }
     }
 
@@ -262,6 +256,7 @@ impl RustSearchEguiApp {
         if any_key_pressed {
             self.runtime.show_privilege_overlay = false;
             self.runtime.show_quick_help_overlay = false;
+            self.runtime.show_about_overlay = false;
         }
 
         if close_help_once {
@@ -346,6 +341,18 @@ impl RustSearchEguiApp {
 
 impl eframe::App for RustSearchEguiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let now = Instant::now();
+        let dt_ms = now
+            .saturating_duration_since(self.last_frame_instant)
+            .as_secs_f32()
+            * 1000.0;
+        self.last_frame_instant = now;
+        if self.frame_time_ema_ms <= f32::EPSILON {
+            self.frame_time_ema_ms = dt_ms;
+        } else {
+            self.frame_time_ema_ms = self.frame_time_ema_ms * 0.9 + dt_ms * 0.1;
+        }
+
         let repaint_after = if self.panel_anim_last_tick.is_some()
             || self.runtime.indexing_in_progress
             || self.runtime.active_search_query.is_some()
@@ -369,6 +376,9 @@ impl eframe::App for RustSearchEguiApp {
         if let Some(request) = tick.window_mode_request {
             self.apply_window_mode_request(ctx, request);
         }
+        if let Some(request) = tick.renderer_mode_request {
+            self.renderer = Renderer::from_mode(request);
+        }
         self.sync_window_slide(ctx);
         if tick.should_quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -376,6 +386,10 @@ impl eframe::App for RustSearchEguiApp {
         }
 
         self.apply_hotkeys(ctx);
+        if self.runtime.should_exit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         self.apply_query_text_input(ctx);
 
         egui::CentralPanel::default()
@@ -385,13 +399,72 @@ impl eframe::App for RustSearchEguiApp {
                     .outer_margin(egui::Margin::same(0)),
             )
             .show(ctx, |ui| {
-                if let Err(err) = self.terminal.draw(|frame| {
-                    tui_view::draw(frame, &self.runtime);
-                }) {
-                    self.runtime.last_action = format!("Draw failed: {}", err);
-                }
-                ui.add(self.terminal.backend_mut());
+                let hud = RenderHud {
+                    frame_time_ms: self.frame_time_ema_ms,
+                    repaint_after,
+                };
+                self.renderer.draw(ctx, ui, &self.runtime, hud);
             });
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RenderHud {
+    frame_time_ms: f32,
+    repaint_after: Duration,
+}
+
+enum Renderer {
+    SoftTui(Terminal<RataguiBackend<EmbeddedGraphics>>),
+    GpuEgui,
+}
+
+impl Renderer {
+    fn from_env() -> Self {
+        let mode = env::var("RUSTSEARCH_RENDERER")
+            .unwrap_or_else(|_| "gpu".to_string())
+            .to_ascii_lowercase();
+
+        if mode == "soft" || mode == "ratatui" {
+            Self::from_mode(RendererModeRequest::Soft)
+        } else {
+            Self::from_mode(RendererModeRequest::Gpu)
+        }
+    }
+
+    fn from_mode(mode: RendererModeRequest) -> Self {
+        match mode {
+            RendererModeRequest::Gpu => Self::GpuEgui,
+            RendererModeRequest::Soft => {
+                let font_regular = mono_8x13_atlas();
+                let font_italic = mono_8x13_italic_atlas();
+                let font_bold = mono_8x13_bold_atlas();
+                let soft_backend = SoftBackend::<EmbeddedGraphics>::new(
+                    160,
+                    60,
+                    font_regular,
+                    Some(font_bold),
+                    Some(font_italic),
+                );
+                let backend = RataguiBackend::new("rustsearch", soft_backend);
+                let terminal = Terminal::new(backend).expect("terminal init failed");
+                Self::SoftTui(terminal)
+            }
+        }
+    }
+
+    fn draw(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, app: &AppState, hud: RenderHud) {
+        match self {
+            Self::SoftTui(terminal) => {
+                if let Err(err) = terminal.draw(|frame| {
+                    tui_view::draw(frame, app);
+                }) {
+                    debug_log(&format!("Soft renderer draw failed: {}", err));
+                }
+                ui.add(terminal.backend_mut());
+            }
+            Self::GpuEgui => gpu_ui::draw(ctx, ui, app, hud.frame_time_ms, hud.repaint_after),
+        }
     }
 }
 
@@ -560,6 +633,12 @@ pub(crate) enum IndexEvent {
 pub(crate) enum WindowModeRequest {
     ToggleFullscreen,
     ToggleFullHeight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RendererModeRequest {
+    Gpu,
+    Soft,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

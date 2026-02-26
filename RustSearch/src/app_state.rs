@@ -20,8 +20,8 @@ use crate::storage::{
     load_persisted_scope, load_quick_help_dismissed, persist_quick_help_dismissed, persist_scope,
 };
 use crate::{
-    debug_log, estimate_index_memory_bytes, IndexBackend, IndexEvent, SearchItem, SearchScope,
-    WindowModeRequest, DEFAULT_LATEST_WINDOW_SECS, DELTA_REFRESH_COOLDOWN,
+    debug_log, estimate_index_memory_bytes, IndexBackend, IndexEvent, RendererModeRequest,
+    SearchItem, SearchScope, WindowModeRequest, DEFAULT_LATEST_WINDOW_SECS, DELTA_REFRESH_COOLDOWN,
     FILENAME_INDEX_BUILD_BATCH, KEYBOARD_PAGE_JUMP, MAX_INDEX_EVENTS_PER_TICK,
     MAX_SEARCH_EVENTS_PER_TICK, QUERY_DEBOUNCE_DELAY, UNKNOWN_TS, VISIBLE_RESULTS_LIMIT,
 };
@@ -31,6 +31,7 @@ pub(crate) struct TickOutcome {
     pub(crate) focus_search: bool,
     pub(crate) should_quit: bool,
     pub(crate) window_mode_request: Option<WindowModeRequest>,
+    pub(crate) renderer_mode_request: Option<RendererModeRequest>,
 }
 
 pub(crate) struct AppState {
@@ -63,6 +64,7 @@ pub(crate) struct AppState {
     pub(crate) use_dirwalk_fallback: bool,
     pub(crate) show_privilege_overlay: bool,
     pub(crate) show_quick_help_overlay: bool,
+    pub(crate) show_about_overlay: bool,
     pub(crate) quick_help_selected_action: usize,
     pub(crate) pending_query: Option<(String, Instant, u64)>,
     pub(crate) query_edit_counter: u64,
@@ -90,6 +92,7 @@ pub(crate) struct AppState {
     pub(crate) skip_scope_persist_once: bool,
     pub(crate) should_exit: bool,
     pub(crate) pending_window_mode_request: Option<WindowModeRequest>,
+    pub(crate) pending_renderer_mode_request: Option<RendererModeRequest>,
 }
 
 impl AppState {
@@ -148,6 +151,7 @@ impl AppState {
             use_dirwalk_fallback: !is_elevated,
             show_privilege_overlay: !is_elevated,
             show_quick_help_overlay: is_elevated && !load_quick_help_dismissed(),
+            show_about_overlay: false,
             quick_help_selected_action: 0,
             pending_query: None,
             query_edit_counter: 0,
@@ -175,6 +179,7 @@ impl AppState {
             skip_scope_persist_once: !is_elevated && arg_scope_override.is_none(),
             should_exit: false,
             pending_window_mode_request: None,
+            pending_renderer_mode_request: None,
         };
 
         app.begin_index(app.scope.clone());
@@ -187,6 +192,9 @@ impl AppState {
         }
         if self.show_quick_help_overlay {
             self.show_quick_help_overlay = false;
+        }
+        if self.show_about_overlay {
+            self.show_about_overlay = false;
         }
 
         self.raw_query = query;
@@ -245,6 +253,10 @@ impl AppState {
     }
 
     pub(crate) fn on_escape(&mut self) {
+        if self.show_about_overlay {
+            self.show_about_overlay = false;
+            return;
+        }
         if self.show_quick_help_overlay {
             self.show_quick_help_overlay = false;
             return;
@@ -453,6 +465,33 @@ impl AppState {
             return;
         }
 
+        if parsed.switch_renderer_gpu {
+            self.pending_renderer_mode_request = Some(RendererModeRequest::Gpu);
+            self.last_action = "Switching renderer to GPU".to_string();
+            if command_invocation {
+                self.clear_command_input();
+            }
+            return;
+        }
+
+        if parsed.switch_renderer_soft {
+            self.pending_renderer_mode_request = Some(RendererModeRequest::Soft);
+            self.last_action = "Switching renderer to soft".to_string();
+            if command_invocation {
+                self.clear_command_input();
+            }
+            return;
+        }
+
+        if parsed.show_about {
+            self.show_about_overlay = true;
+            self.last_action = "Showing about info".to_string();
+            if command_invocation {
+                self.clear_command_input();
+            }
+            return;
+        }
+
         if parsed.reindex_current_scope {
             self.latest_only_mode = false;
             self.query.clear();
@@ -543,9 +582,11 @@ impl AppState {
             focus_search: false,
             should_quit: false,
             window_mode_request: None,
+            renderer_mode_request: None,
         };
 
         out.window_mode_request = self.pending_window_mode_request.take();
+        out.renderer_mode_request = self.pending_renderer_mode_request.take();
 
         if self.visual_progress_test_active {
             self.indexing_in_progress = true;

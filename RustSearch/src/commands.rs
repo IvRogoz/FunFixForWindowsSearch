@@ -12,6 +12,9 @@ pub(crate) struct ParsedDirective {
     pub(crate) toggle_tracking: bool,
     pub(crate) toggle_fullscreen: bool,
     pub(crate) toggle_fullheight: bool,
+    pub(crate) switch_renderer_gpu: bool,
+    pub(crate) switch_renderer_soft: bool,
+    pub(crate) show_about: bool,
 }
 
 pub(crate) fn parse_scope_directive(input: &str) -> ParsedDirective {
@@ -26,6 +29,9 @@ pub(crate) fn parse_scope_directive(input: &str) -> ParsedDirective {
     let mut toggle_tracking = false;
     let mut toggle_fullscreen = false;
     let mut toggle_fullheight = false;
+    let mut switch_renderer_gpu = false;
+    let mut switch_renderer_soft = false;
+    let mut show_about = false;
 
     for token in input.split_whitespace() {
         let normalized = token.to_ascii_lowercase();
@@ -85,6 +91,21 @@ pub(crate) fn parse_scope_directive(input: &str) -> ParsedDirective {
             continue;
         }
 
+        if normalized == "/gpu" {
+            switch_renderer_gpu = true;
+            continue;
+        }
+
+        if normalized == "/soft" {
+            switch_renderer_soft = true;
+            continue;
+        }
+
+        if normalized == "/about" {
+            show_about = true;
+            continue;
+        }
+
         if latest_only && latest_window_secs.is_none() {
             if let Some(seconds) = parse_latest_window_token(&normalized) {
                 latest_window_secs = Some(seconds);
@@ -111,6 +132,9 @@ pub(crate) fn parse_scope_directive(input: &str) -> ParsedDirective {
         toggle_tracking,
         toggle_fullscreen,
         toggle_fullheight,
+        switch_renderer_gpu,
+        switch_renderer_soft,
+        show_about,
     }
 }
 
@@ -163,6 +187,18 @@ pub(crate) fn command_menu_items(input: &str, tracking_enabled: bool) -> Vec<Com
         CommandMenuItem {
             command: "/fullheight",
             description: "Toggle full-height mode",
+        },
+        CommandMenuItem {
+            command: "/gpu",
+            description: "Switch to GPU renderer",
+        },
+        CommandMenuItem {
+            command: "/soft",
+            description: "Switch to soft renderer",
+        },
+        CommandMenuItem {
+            command: "/about",
+            description: "Show app information",
         },
         CommandMenuItem {
             command: "/latest",
@@ -281,6 +317,9 @@ pub(crate) fn is_exact_directive_token(token: &str, tracking_enabled: bool) -> b
             | "/reindex"
             | "/fullscreen"
             | "/fullheight"
+            | "/gpu"
+            | "/soft"
+            | "/about"
             | "/exit"
     ) || parse_drive_directive(token).is_some();
 
