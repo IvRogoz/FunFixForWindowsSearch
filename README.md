@@ -2,7 +2,7 @@
 
 WizMini is a native, keyboard-first Windows file finder. It runs in the tray, opens with a global hotkey, and focuses on fast filename/path lookup with NTFS + USN live updates when available.
 
-![WizMini demo](app.gif)
+![WizMini demo](app_new.gif)
 
 ## Requirements
 
