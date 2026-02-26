@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented in this file.
 
+## 2026-02-26
+
+### Added
+- Added a new standalone `RustSearch` app (`RustSearch/`) as an `egui` + `egui_ratatui` + `ratatui` implementation of the native launcher workflow.
+- Added RustSearch command parity for scope, indexing, and utility directives, including `/entire`, `/all`, `/x:`, `/up`, `/track`, `/latest`, `/last`, `/reindex`, `/testProgress`, `/fullscreen`, `/fullheight`, and `/exit`.
+- Added RustSearch tray + global hotkey integration and startup privilege notice overlay with centered ASCII-art warning presentation.
+- Added RustSearch implementation docs (`RustSearch/README.md`, `RustSearch/REBUILD_PLAN.md`, `RustSearch/IMPLEMENTATION_REPORT.md`).
+
+### Changed
+- Changed RustSearch window behavior to use top slide in/out motion, borderless viewport styling, centered width positioning, and visible-by-default startup.
+- Changed RustSearch command menu to render as a true popup overlay (separate background) without pushing results layout.
+- Changed RustSearch progress phase labels to user-facing terms (`reading snapshot`, `reading index`, `finalizing index`, `live updates`, `ready`) and improved progress label contrast.
+
+### Fixed
+- Fixed RustSearch result navigation so selection movement scrolls through off-screen rows.
+- Fixed RustSearch notice overlays to dismiss on first keypress and preserve readable spacing around content.
+- Fixed RustSearch command execution flow so slash-command Enter clears the query prompt while normal search Enter behavior remains unchanged.
+
 ## 2026-02-23
 
 ### Changed
