@@ -8,12 +8,7 @@ use crate::{
     debug_log, IndexBackend, IndexEvent, SearchItem, SearchItemKind, SearchScope, UNKNOWN_TS,
 };
 
-pub(crate) fn run_index_job(
-    scope: SearchScope,
-    job_id: u64,
-    tx: mpsc::Sender<IndexEvent>,
-    allow_dirwalk_fallback: bool,
-) {
+pub(crate) fn run_index_job(scope: SearchScope, job_id: u64, tx: mpsc::Sender<IndexEvent>) {
     debug_log(&format!(
         "run_index_job start job_id={} scope={}",
         job_id,
@@ -49,8 +44,7 @@ pub(crate) fn run_index_job(
         let _ = tx.send(IndexEvent::SnapshotLoaded { job_id, items });
     }
 
-    let (items, backend) =
-        index_files_for_scope_with_progress(scope.clone(), job_id, &tx, allow_dirwalk_fallback);
+    let (items, backend) = index_files_for_scope_with_progress(scope.clone(), job_id, &tx);
     persist_scope_snapshot_async(scope.clone(), items.clone());
     debug_log(&format!(
         "run_index_job finished job_id={} items={} backend= {}",
@@ -69,7 +63,6 @@ fn index_files_for_scope_with_progress(
     scope: SearchScope,
     job_id: u64,
     tx: &mpsc::Sender<IndexEvent>,
-    allow_dirwalk_fallback: bool,
 ) -> (Vec<SearchItem>, IndexBackend) {
     let roots = scope_roots(&scope);
     let mut out = Vec::new();
@@ -79,32 +72,10 @@ fn index_files_for_scope_with_progress(
 
     for root in roots {
         let Some(drive_letter) = drive_letter_from_root_str(&root) else {
-            if !allow_dirwalk_fallback {
-                continue;
-            }
-
             used_walkdir = true;
-            for entry in WalkDir::new(&root)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(Result::ok)
-            {
-                if !entry.file_type().is_file() && !entry.file_type().is_dir() {
-                    continue;
-                }
-
-                out.push(search_item_from_walkdir_entry(&entry));
-                scanned += 1;
-
-                if scanned.is_multiple_of(500) {
-                    let _ = tx.send(IndexEvent::Progress {
-                        job_id,
-                        current: scanned,
-                        total: 0,
-                        phase: "index",
-                    });
-                }
-            }
+            let items = walk_root_with_progress(&root, job_id, tx);
+            scanned += items.len();
+            out.extend(items);
             continue;
         };
 
@@ -124,33 +95,10 @@ fn index_files_for_scope_with_progress(
             continue;
         }
 
-        if !allow_dirwalk_fallback {
-            continue;
-        }
-
         used_walkdir = true;
-
-        for entry in WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() && !entry.file_type().is_dir() {
-                continue;
-            }
-
-            out.push(search_item_from_walkdir_entry(&entry));
-            scanned += 1;
-
-            if scanned.is_multiple_of(500) {
-                let _ = tx.send(IndexEvent::Progress {
-                    job_id,
-                    current: scanned,
-                    total: 0,
-                    phase: "index",
-                });
-            }
-        }
+        let items = walk_root_with_progress(&root, job_id, tx);
+        scanned += items.len();
+        out.extend(items);
     }
 
     let _ = tx.send(IndexEvent::Progress {
@@ -169,6 +117,33 @@ fn index_files_for_scope_with_progress(
         IndexBackend::Detecting
     };
     (out, backend)
+}
+
+pub(crate) fn walk_root_with_progress(
+    root: &str,
+    job_id: u64,
+    tx: &mpsc::Sender<IndexEvent>,
+) -> Vec<SearchItem> {
+    let mut items = Vec::new();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() && !entry.file_type().is_dir() {
+            continue;
+        }
+        items.push(search_item_from_walkdir_entry(&entry));
+        if items.len().is_multiple_of(500) {
+            let _ = tx.send(IndexEvent::Progress {
+                job_id,
+                current: items.len(),
+                total: 0,
+                phase: "index",
+            });
+        }
+    }
+    items
 }
 
 fn search_item_from_walkdir_entry(entry: &walkdir::DirEntry) -> SearchItem {
@@ -254,4 +229,38 @@ fn normalized_folder_prefix(path: &str) -> String {
 fn path_starts_with_folder(path: &str, folder_prefix: &str) -> bool {
     let normalized = path.replace('/', "\\").to_ascii_lowercase();
     normalized.starts_with(folder_prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_fallback_includes_files_and_folders() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rustsearch-fallback-{}-{unique}",
+            std::process::id()
+        ));
+        let folder = root.join("folder");
+        let file = folder.join("file.txt");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&file, "test").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let items = walk_root_with_progress(root.to_str().unwrap(), 1, &tx);
+        assert!(items
+            .iter()
+            .any(|item| item.path.as_ref() == file.to_str().unwrap()
+                && item.kind == SearchItemKind::File));
+        assert!(items
+            .iter()
+            .any(|item| item.path.as_ref() == folder.to_str().unwrap()
+                && item.kind == SearchItemKind::Folder));
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(folder).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 }

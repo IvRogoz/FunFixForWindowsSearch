@@ -53,12 +53,52 @@ pub(crate) fn request_self_elevation(_scope: &SearchScope) -> Result<(), String>
     Err("Elevation is only supported on Windows".to_string())
 }
 
+#[cfg(target_os = "windows")]
 pub(crate) fn open_path(path: &str) -> Result<(), String> {
-    Command::new("cmd")
-        .args(["/C", "start", "", path])
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    let path = open_path_wide(path)?;
+    let verb = to_wide("open");
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWDEFAULT,
+        )
+    } as isize;
+    if result <= 32 {
+        Err(format!("Failed to open path (code {})", result))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn open_path(_path: &str) -> Result<(), String> {
+    Err("Opening paths is only supported on Windows".to_string())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn open_path_wide(path: &str) -> Result<Vec<u16>, String> {
+    if path.contains('\0') {
+        return Err("Path contains a NUL character".to_string());
+    }
+    Ok(path.encode_utf16().chain(std::iter::once(0)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_path_wide;
+
+    #[test]
+    fn open_path_encoding_preserves_shell_metacharacters_and_rejects_nul() {
+        let path = "C:\\test & more\\é.txt";
+        let mut expected: Vec<u16> = path.encode_utf16().collect();
+        expected.push(0);
+        assert_eq!(open_path_wide(path).unwrap(), expected);
+        assert!(open_path_wide("before\0after").is_err());
+    }
 }
 
 pub(crate) fn reveal_path(path: &str) -> Result<(), String> {

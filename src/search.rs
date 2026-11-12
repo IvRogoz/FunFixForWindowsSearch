@@ -39,17 +39,6 @@ impl SearchQuery {
                 .any(|terms| terms.iter().all(|term| query_matches_item(term, item))),
         }
     }
-
-    pub(crate) fn boolean_groups(&self) -> Option<&[Vec<String>]> {
-        match &self.expr {
-            SearchExpr::Single(_) => None,
-            SearchExpr::Or(groups) => Some(groups),
-        }
-    }
-}
-
-pub(crate) fn query_uses_boolean_logic(query: &str) -> bool {
-    parse_boolean_query(query.trim()).is_some()
 }
 
 pub(crate) fn query_has_incomplete_boolean_logic(query: &str) -> bool {
@@ -178,18 +167,18 @@ pub(crate) fn contains_ascii_case_insensitive(haystack: &str, needle_lower_ascii
 }
 
 fn wildcard_match_ascii_insensitive(pattern_lower_ascii: &str, text: &str) -> bool {
-    let p = pattern_lower_ascii.as_bytes();
-    let t = text.as_bytes();
+    let p: Vec<char> = pattern_lower_ascii.chars().collect();
+    let t: Vec<char> = text.chars().collect();
 
     let (mut pi, mut ti) = (0usize, 0usize);
     let mut star_pi: Option<usize> = None;
     let mut star_ti = 0usize;
 
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == t[ti].to_ascii_lowercase() || p[pi] == b'?') {
+        if pi < p.len() && (p[pi] == t[ti].to_ascii_lowercase() || p[pi] == '?') {
             pi += 1;
             ti += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
+        } else if pi < p.len() && p[pi] == '*' {
             star_pi = Some(pi);
             pi += 1;
             star_ti = ti;
@@ -202,7 +191,7 @@ fn wildcard_match_ascii_insensitive(pattern_lower_ascii: &str, text: &str) -> bo
         }
     }
 
-    while pi < p.len() && p[pi] == b'*' {
+    while pi < p.len() && p[pi] == '*' {
         pi += 1;
     }
 
@@ -269,6 +258,9 @@ mod tests {
         };
         assert!(query_matches_item("n*.txt", &item));
         assert!(query_matches_item("*tmp*", &item));
+        assert!(wildcard_match_ascii_insensitive("caf?.txt", "café.TXT"));
+        assert!(wildcard_match_ascii_insensitive("*?é*.txt", "un café.TXT"));
+        assert!(!wildcard_match_ascii_insensitive("caf??.txt", "café.txt"));
     }
 
     #[test]
@@ -316,8 +308,14 @@ mod tests {
             kind: SearchItemKind::File,
         };
 
-        assert!(!query_uses_boolean_logic("candy"));
-        assert!(!query_uses_boolean_logic("orange"));
+        assert!(matches!(
+            SearchQuery::parse("candy").expr,
+            SearchExpr::Single(_)
+        ));
+        assert!(matches!(
+            SearchQuery::parse("orange").expr,
+            SearchExpr::Single(_)
+        ));
         assert!(SearchQuery::parse("candy orange").matches_item(&item));
     }
 

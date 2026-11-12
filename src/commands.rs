@@ -351,7 +351,8 @@ pub(crate) fn is_exact_directive_token(token: &str, tracking_enabled: bool) -> b
             | "/soft"
             | "/about"
             | "/exit"
-    ) || parse_drive_directive(token).is_some();
+    ) || parse_drive_directive(token).is_some()
+        || normalized.starts_with("/rows:");
 
     if tracking_enabled {
         is_known = is_known || normalized == "/latest" || normalized == "/last";
@@ -389,6 +390,7 @@ mod tests {
         assert_eq!(parsed.result_rows, Some(40));
 
         let parsed = parse_scope_directive("/rows:32");
+        assert!(is_exact_directive_token("/rows:32", false));
         assert!(parsed.result_rows_directive);
         assert_eq!(parsed.result_rows, Some(32));
     }

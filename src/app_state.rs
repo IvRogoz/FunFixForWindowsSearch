@@ -16,10 +16,7 @@ use crate::commands::{
 };
 use crate::indexing;
 use crate::platform::{is_process_elevated, open_path, request_self_elevation, reveal_path};
-use crate::search::{
-    contains_ascii_case_insensitive, file_name_from_path, query_has_incomplete_boolean_logic,
-    query_uses_boolean_logic, SearchQuery,
-};
+use crate::search::query_has_incomplete_boolean_logic;
 use crate::search_worker::{SearchEvent, SearchWorkerMessage};
 use crate::storage::{
     load_persisted_scope, load_quick_help_dismissed, persist_quick_help_dismissed, persist_scope,
@@ -27,9 +24,9 @@ use crate::storage::{
 use crate::{
     debug_log, estimate_index_memory_bytes, IndexBackend, IndexEvent, RendererModeRequest,
     SearchItem, SearchScope, WindowModeRequest, DEFAULT_LATEST_WINDOW_SECS, DEFAULT_RESULT_ROWS,
-    DELTA_REFRESH_COOLDOWN, FILENAME_INDEX_BUILD_BATCH, KEYBOARD_PAGE_JUMP,
-    MAX_INDEX_EVENTS_PER_TICK, MAX_RESULT_ROWS, MAX_SEARCH_EVENTS_PER_TICK, MIN_RESULT_ROWS,
-    QUERY_DEBOUNCE_DELAY, UNKNOWN_TS, VISIBLE_RESULTS_LIMIT,
+    DELTA_REFRESH_COOLDOWN, KEYBOARD_PAGE_JUMP, MAX_INDEX_EVENTS_PER_TICK, MAX_RESULT_ROWS,
+    MAX_SEARCH_EVENTS_PER_TICK, MIN_RESULT_ROWS, QUERY_DEBOUNCE_DELAY, UNKNOWN_TS,
+    VISIBLE_RESULTS_LIMIT,
 };
 
 pub(crate) struct TickOutcome {
@@ -67,7 +64,6 @@ pub(crate) struct AppState {
     pub(crate) visual_progress_test_active: bool,
     pub(crate) indexing_is_refresh: bool,
     pub(crate) is_elevated: bool,
-    pub(crate) use_dirwalk_fallback: bool,
     pub(crate) show_privilege_overlay: bool,
     pub(crate) show_quick_help_overlay: bool,
     pub(crate) show_about_overlay: bool,
@@ -80,11 +76,6 @@ pub(crate) struct AppState {
     pub(crate) active_search_job: Option<u64>,
     pub(crate) active_search_query: Option<String>,
     pub(crate) active_search_cursor: usize,
-    pub(crate) filename_exact_index: HashMap<String, Vec<usize>>,
-    pub(crate) filename_prefix_index: HashMap<String, Vec<usize>>,
-    pub(crate) filename_index_dirty: bool,
-    pub(crate) filename_index_building: bool,
-    pub(crate) filename_index_build_cursor: usize,
     pub(crate) needs_search_refresh: bool,
     pub(crate) next_search_refresh_at: Instant,
     pub(crate) latest_only_mode: bool,
@@ -155,7 +146,6 @@ impl AppState {
             visual_progress_test_active: false,
             indexing_is_refresh: false,
             is_elevated,
-            use_dirwalk_fallback: !is_elevated,
             show_privilege_overlay: !is_elevated,
             show_quick_help_overlay: is_elevated && !load_quick_help_dismissed(),
             show_about_overlay: false,
@@ -168,11 +158,6 @@ impl AppState {
             active_search_job: None,
             active_search_query: None,
             active_search_cursor: 0,
-            filename_exact_index: HashMap::new(),
-            filename_prefix_index: HashMap::new(),
-            filename_index_dirty: true,
-            filename_index_building: false,
-            filename_index_build_cursor: 0,
             needs_search_refresh: false,
             next_search_refresh_at: Instant::now(),
             latest_only_mode: false,
@@ -579,9 +564,6 @@ impl AppState {
         self.indexing_is_refresh = false;
         self.index_backend = IndexBackend::Detecting;
         self.index_memory_bytes = 0;
-        self.filename_index_dirty = true;
-        self.filename_index_building = false;
-        self.filename_index_build_cursor = 0;
         self.cancel_active_search();
         let _ = self.search_tx.send(SearchWorkerMessage::Clear);
         self.needs_search_refresh = false;
@@ -593,9 +575,8 @@ impl AppState {
         let (tx, rx) = mpsc::channel::<IndexEvent>();
         self.index_rx = Some(rx);
 
-        let allow_dirwalk_fallback = self.use_dirwalk_fallback;
         thread::spawn(move || {
-            indexing::run_index_job(scope, job_id, tx, allow_dirwalk_fallback);
+            indexing::run_index_job(scope, job_id, tx);
         });
     }
 
@@ -642,10 +623,6 @@ impl AppState {
                 self.next_search_refresh_at = Instant::now() + DELTA_REFRESH_COOLDOWN;
                 self.schedule_search_from_current_query();
             }
-
-            if self.pending_query.is_none() {
-                self.process_filename_index_build_step();
-            }
         }
 
         for _ in 0..MAX_SEARCH_EVENTS_PER_TICK {
@@ -690,9 +667,6 @@ impl AppState {
                         if self.active_index_job == Some(job_id) {
                             self.all_items = items;
                             self.indexing_is_refresh = true;
-                            self.filename_index_dirty = true;
-                            self.filename_index_building = false;
-                            self.filename_index_build_cursor = 0;
                             self.recompute_index_memory_bytes();
                             self.push_corpus_to_search_worker();
                             self.schedule_search_from_current_query();
@@ -730,9 +704,6 @@ impl AppState {
                             self.indexing_phase = "done";
                             self.index_backend = backend;
                             self.all_items = items;
-                            self.filename_index_dirty = true;
-                            self.filename_index_building = false;
-                            self.filename_index_build_cursor = 0;
                             self.recompute_index_memory_bytes();
                             self.recent_event_by_path.clear();
                             self.changes_added_since_index = 0;
@@ -889,22 +860,6 @@ impl AppState {
             self.cancel_active_search();
             self.clamp_selected();
         } else {
-            if !self.latest_only_mode {
-                if let Some(results) = self.try_fast_boolean_search(&q) {
-                    self.items = results;
-                    self.cancel_active_search();
-                    self.clamp_selected();
-                    return;
-                }
-
-                if let Some(results) = self.try_fast_filename_search(&q) {
-                    self.items = results;
-                    self.cancel_active_search();
-                    self.clamp_selected();
-                    return;
-                }
-            }
-
             self.search_generation = self.search_generation.wrapping_add(1);
             let generation = self.search_generation;
             self.active_search_job = Some(generation);
@@ -917,192 +872,6 @@ impl AppState {
                 latest_window_secs: self.latest_window_secs,
             });
         }
-    }
-
-    fn process_filename_index_build_step(&mut self) {
-        if !self.filename_index_dirty {
-            return;
-        }
-
-        if !self.filename_index_building {
-            self.filename_exact_index.clear();
-            self.filename_prefix_index.clear();
-            self.filename_index_build_cursor = 0;
-            self.filename_index_building = true;
-        }
-
-        let end = (self.filename_index_build_cursor + FILENAME_INDEX_BUILD_BATCH)
-            .min(self.all_items.len());
-        for index in self.filename_index_build_cursor..end {
-            let item = &self.all_items[index];
-            let name_lower = file_name_from_path(item.path.as_ref()).to_ascii_lowercase();
-            self.filename_exact_index
-                .entry(name_lower.clone())
-                .or_default()
-                .push(index);
-
-            let mut prefix = String::new();
-            for ch in name_lower.chars().take(3) {
-                prefix.push(ch);
-                self.filename_prefix_index
-                    .entry(prefix.clone())
-                    .or_default()
-                    .push(index);
-            }
-        }
-
-        self.filename_index_build_cursor = end;
-        if self.filename_index_build_cursor >= self.all_items.len() {
-            self.filename_index_dirty = false;
-            self.filename_index_building = false;
-            self.filename_index_build_cursor = 0;
-        }
-    }
-
-    fn try_fast_filename_search(&mut self, query_lower: &str) -> Option<Vec<SearchItem>> {
-        if query_lower.is_empty()
-            || query_lower.contains('*')
-            || query_lower.contains('?')
-            || query_lower.contains('\\')
-            || query_lower.contains('/')
-            || query_lower.contains(':')
-            || query_uses_boolean_logic(query_lower)
-        {
-            return None;
-        }
-
-        if self.filename_index_dirty || self.filename_index_building {
-            return None;
-        }
-
-        let mut out = Vec::new();
-        let mut seen: HashSet<usize> = HashSet::new();
-
-        if let Some(exact) = self.filename_exact_index.get(query_lower) {
-            for &idx in exact {
-                if seen.insert(idx) {
-                    out.push(self.all_items[idx].clone());
-                    if out.len() >= VISIBLE_RESULTS_LIMIT {
-                        return Some(out);
-                    }
-                }
-            }
-        }
-
-        let mut prefix_key = String::new();
-        for ch in query_lower.chars().take(3) {
-            prefix_key.push(ch);
-        }
-
-        if let Some(candidates) = self.filename_prefix_index.get(&prefix_key) {
-            for &idx in candidates {
-                if seen.contains(&idx) {
-                    continue;
-                }
-
-                let name = file_name_from_path(self.all_items[idx].path.as_ref());
-                if contains_ascii_case_insensitive(name, query_lower) {
-                    seen.insert(idx);
-                    out.push(self.all_items[idx].clone());
-                    if out.len() >= VISIBLE_RESULTS_LIMIT {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if out.is_empty() {
-            None
-        } else {
-            Some(out)
-        }
-    }
-
-    fn try_fast_boolean_search(&mut self, query_lower: &str) -> Option<Vec<SearchItem>> {
-        if !query_uses_boolean_logic(query_lower)
-            || self.filename_index_dirty
-            || self.filename_index_building
-        {
-            return None;
-        }
-
-        let parsed = SearchQuery::parse(query_lower);
-        let groups = parsed.boolean_groups()?;
-        let mut out = Vec::new();
-        let mut seen: HashSet<usize> = HashSet::new();
-
-        for group in groups {
-            let candidates = self.boolean_group_candidates(group)?;
-            for idx in candidates {
-                if seen.contains(&idx) {
-                    continue;
-                }
-                let item = &self.all_items[idx];
-                if parsed.matches_item(item) {
-                    seen.insert(idx);
-                    out.push(item.clone());
-                    if out.len() >= VISIBLE_RESULTS_LIMIT {
-                        return Some(out);
-                    }
-                }
-            }
-        }
-
-        Some(out)
-    }
-
-    fn boolean_group_candidates(&self, terms: &[String]) -> Option<Vec<usize>> {
-        let seed = terms
-            .iter()
-            .filter_map(|term| self.filename_candidate_indices(term))
-            .min_by_key(Vec::len)?;
-
-        Some(seed)
-    }
-
-    fn filename_candidate_indices(&self, query_lower: &str) -> Option<Vec<usize>> {
-        if query_lower.is_empty()
-            || query_lower.contains('*')
-            || query_lower.contains('?')
-            || query_lower.contains('\\')
-            || query_lower.contains('/')
-            || query_lower.contains(':')
-            || query_uses_boolean_logic(query_lower)
-        {
-            return None;
-        }
-
-        let mut out = Vec::new();
-        let mut seen: HashSet<usize> = HashSet::new();
-
-        if let Some(exact) = self.filename_exact_index.get(query_lower) {
-            for &idx in exact {
-                if seen.insert(idx) {
-                    out.push(idx);
-                }
-            }
-        }
-
-        let mut prefix_key = String::new();
-        for ch in query_lower.chars().take(3) {
-            prefix_key.push(ch);
-        }
-
-        if let Some(candidates) = self.filename_prefix_index.get(&prefix_key) {
-            for &idx in candidates {
-                if seen.contains(&idx) {
-                    continue;
-                }
-
-                let name = file_name_from_path(self.all_items[idx].path.as_ref());
-                if contains_ascii_case_insensitive(name, query_lower) {
-                    seen.insert(idx);
-                    out.push(idx);
-                }
-            }
-        }
-
-        Some(out)
     }
 
     fn clamp_selected(&mut self) {
@@ -1166,9 +935,6 @@ impl AppState {
         }
 
         self.needs_search_refresh = true;
-        self.filename_index_dirty = true;
-        self.filename_index_building = false;
-        self.filename_index_build_cursor = 0;
         (added_count, updated_count, deleted_count)
     }
 }

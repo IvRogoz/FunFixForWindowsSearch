@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.1.11 - 2026-11-12
+
+### Fixed
+
+- Open search results through Windows ShellExecute instead of passing paths to `cmd`, preventing shell interpretation of file names.
+- Removed incomplete search shortcuts that could omit substring, path, and Boolean matches.
+- Update descendant paths when an indexed directory is renamed or moved.
+- Preserve all indexed volumes and fallback results when an NTFS volume recovers.
+- Resume USN tracking only when the original journal position is still available; otherwise rebuild the volume index.
+- Fall back to directory walking for individual volumes that cannot use NTFS indexing, including when elevated. Mixed scopes report partial live tracking.
+- Select the newest 600 `/latest` results across all matches while keeping batch storage bounded.
+- Recognize `/rows:N` when executing the command.
+- Make wildcard `?` match one Unicode character, including characters encoded with multiple UTF-8 bytes.
+
+### Verified
+
+- `rustfmt --edition 2021 --check src/main.rs`
+- `git diff --check`
+- 17 tests passed in a dependency-free harness; the full Cargo test suite was not run.
+- `cargo build --release --locked`
+- GUI and live Windows behavior were not validated.
+
 ## v0.1.10 - 2026-07-06
 
 ### Added

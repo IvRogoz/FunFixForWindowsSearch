@@ -32,7 +32,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN,
 const VISIBLE_RESULTS_LIMIT: usize = 600;
 const QUERY_DEBOUNCE_DELAY: Duration = Duration::from_millis(70);
 const SEARCH_BATCH_SIZE: usize = 12_000;
-const FILENAME_INDEX_BUILD_BATCH: usize = 1_000;
 const DEFAULT_LATEST_WINDOW_SECS: i64 = 5 * 60;
 const DELTA_REFRESH_COOLDOWN: Duration = Duration::from_millis(300);
 const FILE_PATH_MAX_CHARS: usize = 86;
@@ -717,6 +716,7 @@ pub(crate) enum IndexBackend {
     WalkDir,
     NtfsMft,
     NtfsUsnLive,
+    NtfsUsnLiveMixed,
     Mixed,
 }
 
@@ -727,12 +727,21 @@ impl IndexBackend {
             Self::WalkDir => "dirwalk",
             Self::NtfsMft => "ntfs-mft",
             Self::NtfsUsnLive => "ntfs-usn-live",
+            Self::NtfsUsnLiveMixed => "ntfs-usn-live+dirwalk",
             Self::Mixed => "mixed",
         }
     }
 
     pub(crate) fn live_updates(self) -> bool {
-        matches!(self, Self::NtfsUsnLive)
+        matches!(self, Self::NtfsUsnLive | Self::NtfsUsnLiveMixed)
+    }
+
+    pub(crate) fn live_label(self) -> &'static str {
+        match self {
+            Self::NtfsUsnLive => "on",
+            Self::NtfsUsnLiveMixed => "partial",
+            _ => "off",
+        }
     }
 }
 
@@ -740,7 +749,7 @@ pub(crate) fn backend_status_color(backend: IndexBackend) -> Color {
     match backend {
         IndexBackend::NtfsUsnLive => Color::Rgb(117, 227, 140),
         IndexBackend::NtfsMft => Color::Rgb(130, 210, 255),
-        IndexBackend::Mixed => Color::Rgb(255, 198, 92),
+        IndexBackend::Mixed | IndexBackend::NtfsUsnLiveMixed => Color::Rgb(255, 198, 92),
         IndexBackend::WalkDir => Color::Rgb(184, 184, 184),
         IndexBackend::Detecting => Color::Rgb(170, 170, 170),
     }

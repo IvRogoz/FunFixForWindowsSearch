@@ -318,11 +318,7 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         ),
         Span::raw(" | LIVE: "),
         Span::styled(
-            if app.index_backend.live_updates() {
-                "on"
-            } else {
-                "off"
-            },
+            app.index_backend.live_label(),
             Style::default().fg(if app.index_backend.live_updates() {
                 Color::Rgb(117, 227, 140)
             } else {

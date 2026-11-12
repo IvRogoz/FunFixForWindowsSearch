@@ -279,11 +279,7 @@ fn draw_footer(ui: &mut egui::Ui, app: &AppState, frame_time_ms: f32, repaint_af
             egui::RichText::new(format!(
                 "Enter open | Alt+Enter reveal | Esc hide | IDX: {} | LIVE: {} | STATE: {} | RENDER: gpu {:.1}ms | TICK: {}ms",
                 app.index_backend.label(),
-                if app.index_backend.live_updates() {
-                    "on"
-                } else {
-                    "off"
-                },
+                app.index_backend.live_label(),
                 if app.indexing_in_progress {
                     "indexing"
                 } else {

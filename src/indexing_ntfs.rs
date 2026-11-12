@@ -9,7 +9,7 @@ mod imp {
 
     use serde::{Deserialize, Serialize};
 
-    use crate::indexing::scope_roots;
+    use crate::indexing::{scope_roots, walk_root_with_progress};
     use crate::storage::persist_scope_snapshot_async;
     use crate::{
         debug_log, IndexBackend, IndexEvent, SearchItem, SearchItemKind, SearchScope, UNKNOWN_TS,
@@ -90,12 +90,18 @@ mod imp {
         tx: &mpsc::Sender<IndexEvent>,
     ) -> bool {
         let mut states = Vec::new();
-        for root in live_volume_roots(&scope) {
+        let mut fallback_roots = Vec::new();
+        for root in scope_roots(&scope) {
             debug_log(&format!(
                 "run_ntfs_live_index_job opening state start job_id={} root={}",
                 job_id, root
             ));
-            if let Some(state) = open_ntfs_volume_state(&root, job_id, tx) {
+            let volume_root =
+                drive_letter_from_path_str(&root).map(|letter| format!("{}:\\", letter));
+            if let Some(state) = volume_root
+                .as_deref()
+                .and_then(|volume| open_ntfs_volume_state(volume, job_id, tx))
+            {
                 debug_log(&format!(
                     "run_ntfs_live_index_job opening state success job_id={} root={} nodes={}",
                     job_id,
@@ -108,6 +114,7 @@ mod imp {
                     "run_ntfs_live_index_job opening state failed job_id={} root={}",
                     job_id, root
                 ));
+                fallback_roots.push(root);
             }
         }
 
@@ -115,13 +122,22 @@ mod imp {
             return false;
         }
 
-        let initial = filter_items_for_scope(&scope, collect_items_from_ntfs_states(&mut states));
+        let fallback_items: Vec<SearchItem> = fallback_roots
+            .iter()
+            .flat_map(|root| walk_root_with_progress(root, job_id, tx))
+            .collect();
+        let backend = if fallback_roots.is_empty() {
+            IndexBackend::NtfsUsnLive
+        } else {
+            IndexBackend::NtfsUsnLiveMixed
+        };
+        let initial = collect_scope_items(&scope, &mut states, &fallback_items);
         persist_scope_snapshot_async(scope.clone(), initial.clone());
         if tx
             .send(IndexEvent::Done {
                 job_id,
                 items: initial,
-                backend: IndexBackend::NtfsUsnLive,
+                backend,
             })
             .is_err()
         {
@@ -133,6 +149,7 @@ mod imp {
 
         let mut keep_running = true;
         while keep_running {
+            let mut recovered = false;
             for state in &mut states {
                 match poll_ntfs_journal(state) {
                     Some(batch) => {
@@ -163,28 +180,21 @@ mod imp {
                         }
                     }
                     None => {
-                        if !recover_ntfs_state(state, job_id, tx) {
-                            continue;
-                        }
-
-                        let items = filter_items_for_scope(
-                            &scope,
-                            collect_items_from_ntfs_states(std::slice::from_mut(state)),
-                        );
-                        persist_scope_snapshot_async(scope.clone(), items.clone());
-                        if tx
-                            .send(IndexEvent::Done {
-                                job_id,
-                                items,
-                                backend: IndexBackend::NtfsUsnLive,
-                            })
-                            .is_err()
-                        {
-                            keep_running = false;
-                            break;
-                        }
+                        recovered |= recover_ntfs_state(state, job_id, tx);
                     }
                 }
+            }
+
+            if recovered && keep_running {
+                let items = collect_scope_items(&scope, &mut states, &fallback_items);
+                persist_scope_snapshot_async(scope.clone(), items.clone());
+                keep_running = tx
+                    .send(IndexEvent::Done {
+                        job_id,
+                        items,
+                        backend,
+                    })
+                    .is_ok();
             }
 
             if keep_running {
@@ -566,8 +576,36 @@ mod imp {
             offset += record_len;
         }
 
+        Some(journal_batch_from_changes(state, changed_ids, deleted_ids))
+    }
+
+    fn journal_batch_from_changes(
+        state: &mut NtfsVolumeState,
+        mut changed_ids: HashSet<u64>,
+        deleted_ids: Vec<u64>,
+    ) -> JournalBatch {
         if !changed_ids.is_empty() || !deleted_ids.is_empty() {
             state.path_cache.clear();
+        }
+
+        let moved_dirs: Vec<u64> = changed_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                if !state.nodes.get(id).is_some_and(|node| node.is_dir) {
+                    return false;
+                }
+                let path = materialize_full_path(
+                    *id,
+                    &state.nodes,
+                    &mut state.path_cache,
+                    &state.drive_prefix,
+                );
+                state.id_to_path.get(id).is_some_and(|old| old != &path)
+            })
+            .collect();
+        if !moved_dirs.is_empty() {
+            changed_ids.extend(ntfs_subtree_ids(&state.nodes, &moved_dirs));
         }
 
         let mut deleted_paths = Vec::new();
@@ -600,39 +638,52 @@ mod imp {
 
         let changed_entries = upserts.len() + deleted_paths.len();
 
-        Some(JournalBatch {
+        JournalBatch {
             upserts,
             deleted_paths,
             changed_entries,
-        })
+        }
     }
 
     fn remove_ntfs_node_and_descendants(nodes: &mut HashMap<u64, NtfsNode>, id: u64) -> Vec<u64> {
-        if !nodes.contains_key(&id) {
-            return Vec::new();
+        let ids = ntfs_subtree_ids(nodes, &[id]);
+        for id in &ids {
+            nodes.remove(id);
         }
+        ids
+    }
 
-        let mut to_remove = vec![id];
+    fn ntfs_subtree_ids(nodes: &HashMap<u64, NtfsNode>, roots: &[u64]) -> Vec<u64> {
+        let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+        for (&id, node) in nodes {
+            children.entry(node.parent_id).or_default().push(id);
+        }
+        let mut pending = roots.to_vec();
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
         let mut index = 0usize;
-
-        while index < to_remove.len() {
-            let parent = to_remove[index];
-            for (candidate_id, node) in nodes.iter() {
-                if node.parent_id == parent && *candidate_id != parent {
-                    to_remove.push(*candidate_id);
-                }
-            }
+        while index < pending.len() {
+            let id = pending[index];
             index += 1;
-        }
-
-        let mut removed_ids = Vec::new();
-        for target in to_remove {
-            if nodes.remove(&target).is_some() {
-                removed_ids.push(target);
+            if !seen.insert(id) || !nodes.contains_key(&id) {
+                continue;
+            }
+            ids.push(id);
+            if let Some(child_ids) = children.get(&id) {
+                pending.extend(child_ids);
             }
         }
+        ids
+    }
 
-        removed_ids
+    fn collect_scope_items(
+        scope: &SearchScope,
+        states: &mut [NtfsVolumeState],
+        fallback_items: &[SearchItem],
+    ) -> Vec<SearchItem> {
+        let mut items = collect_items_from_ntfs_states(states);
+        items.extend_from_slice(fallback_items);
+        filter_items_for_scope(scope, items)
     }
 
     fn collect_items_from_ntfs_states(states: &mut [NtfsVolumeState]) -> Vec<SearchItem> {
@@ -695,27 +746,8 @@ mod imp {
             return false;
         };
 
-        let mut resume_usn = state.next_usn;
-        if let Some(saved) = load_usn_checkpoint(state.drive_letter) {
-            if saved.journal_id == journal.UsnJournalID {
-                resume_usn = resume_usn.max(saved.next_usn);
-            }
-        }
-
-        if resume_usn < journal.FirstUsn {
-            resume_usn = journal.FirstUsn;
-        }
-        if resume_usn > journal.NextUsn {
-            resume_usn = journal.NextUsn;
-        }
-
-        let can_continue = journal.UsnJournalID == state.journal_id
-            && resume_usn >= journal.FirstUsn
-            && resume_usn <= journal.NextUsn;
-
-        if can_continue {
+        if journal_can_resume(state, &journal) {
             state.handle = new_handle;
-            state.next_usn = resume_usn;
             persist_usn_checkpoint(state.drive_letter, state.journal_id, state.next_usn);
             let _ = unsafe { CloseHandle(old_handle) };
             return true;
@@ -740,6 +772,12 @@ mod imp {
 
         let _ = unsafe { CloseHandle(old_handle) };
         true
+    }
+
+    fn journal_can_resume(state: &NtfsVolumeState, journal: &USN_JOURNAL_DATA_V0) -> bool {
+        journal.UsnJournalID == state.journal_id
+            && state.next_usn >= journal.FirstUsn
+            && state.next_usn <= journal.NextUsn
     }
 
     fn open_volume_and_query_journal(drive: char) -> Option<(HANDLE, USN_JOURNAL_DATA_V0)> {
@@ -800,28 +838,6 @@ mod imp {
             .join("usn_checkpoints.txt")
     }
 
-    fn load_usn_checkpoint(drive: char) -> Option<UsnCheckpoint> {
-        let path = checkpoint_file_path();
-        let content = std::fs::read_to_string(path).ok()?;
-        let key = drive.to_ascii_uppercase();
-
-        for line in content.lines() {
-            let mut parts = line.split(',');
-            let drive_part = parts.next()?.chars().next()?.to_ascii_uppercase();
-            let journal_id = parts.next()?.parse::<u64>().ok()?;
-            let next_usn = parts.next()?.parse::<i64>().ok()?;
-
-            if drive_part == key {
-                return Some(UsnCheckpoint {
-                    journal_id,
-                    next_usn,
-                });
-            }
-        }
-
-        None
-    }
-
     fn persist_usn_checkpoint(drive: char, journal_id: u64, next_usn: i64) {
         let path = checkpoint_file_path();
         if let Some(dir) = path.parent() {
@@ -878,20 +894,6 @@ mod imp {
             .join("WizMini")
             .join("snapshots")
             .join(format!("{}.bin", drive.to_ascii_uppercase()))
-    }
-
-    fn live_volume_roots(scope: &SearchScope) -> Vec<String> {
-        let mut roots = Vec::new();
-        for root in scope_roots(scope) {
-            if parse_drive_root_letter(&root).is_some() {
-                roots.push(root);
-            } else if let Some(letter) = drive_letter_from_path_str(&root) {
-                roots.push(format!("{}:\\", letter.to_ascii_uppercase()));
-            }
-        }
-        roots.sort();
-        roots.dedup();
-        roots
     }
 
     fn filter_items_for_scope(scope: &SearchScope, items: Vec<SearchItem>) -> Vec<SearchItem> {
@@ -1111,6 +1113,150 @@ mod imp {
 
     fn unknown_ts() -> i64 {
         UNKNOWN_TS
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn state_with_nodes(drive: char, entries: &[(u64, u64, &str, bool)]) -> NtfsVolumeState {
+            let nodes = entries
+                .iter()
+                .map(|&(id, parent_id, name, is_dir)| {
+                    (
+                        id,
+                        NtfsNode {
+                            parent_id,
+                            name: name.to_string(),
+                            is_dir,
+                            modified_unix_secs: 0,
+                            file_attributes: 0,
+                        },
+                    )
+                })
+                .collect();
+            let mut state = NtfsVolumeState {
+                drive_letter: drive,
+                drive_prefix: format!("{}:\\", drive),
+                handle: std::ptr::null_mut(),
+                journal_id: 7,
+                next_usn: 100,
+                nodes,
+                path_cache: HashMap::new(),
+                id_to_path: HashMap::new(),
+                last_snapshot_write: Instant::now(),
+                changed_since_snapshot: 0,
+            };
+            let changed_ids = state.nodes.keys().copied().collect();
+            journal_batch_from_changes(&mut state, changed_ids, Vec::new());
+            state
+        }
+
+        #[test]
+        fn folder_rename_updates_all_descendant_paths() {
+            let mut state = state_with_nodes(
+                'C',
+                &[
+                    (1, 0, "old", true),
+                    (2, 1, "nested", true),
+                    (3, 2, "file.txt", false),
+                ],
+            );
+            state.nodes.get_mut(&1).unwrap().name = "new".to_string();
+            let batch = journal_batch_from_changes(&mut state, HashSet::from([1]), Vec::new());
+            let paths: HashSet<&str> = batch
+                .upserts
+                .iter()
+                .map(|item| item.path.as_ref())
+                .collect();
+            assert_eq!(
+                paths,
+                HashSet::from(["C:\\new", "C:\\new\\nested", "C:\\new\\nested\\file.txt"])
+            );
+            assert_eq!(
+                batch.deleted_paths.into_iter().collect::<HashSet<_>>(),
+                HashSet::from([
+                    "C:\\old".to_string(),
+                    "C:\\old\\nested".to_string(),
+                    "C:\\old\\nested\\file.txt".to_string(),
+                ])
+            );
+            assert_eq!(state.id_to_path[&3], "C:\\new\\nested\\file.txt");
+        }
+
+        #[test]
+        fn folder_move_emits_child_changes_across_scope_boundary() {
+            let mut state = state_with_nodes(
+                'C',
+                &[
+                    (1, 0, "scope", true),
+                    (2, 1, "moved", true),
+                    (3, 2, "file.txt", false),
+                ],
+            );
+            state.nodes.get_mut(&2).unwrap().parent_id = 0;
+            let batch = journal_batch_from_changes(&mut state, HashSet::from([2]), Vec::new());
+            assert_eq!(batch.deleted_paths.len(), 2);
+            assert!(batch
+                .deleted_paths
+                .iter()
+                .all(|path| path_is_in_folder_scope(path, "C:\\scope")));
+            assert!(batch
+                .upserts
+                .iter()
+                .all(|item| !path_is_in_folder_scope(&item.path, "C:\\scope")));
+
+            state.nodes.get_mut(&2).unwrap().parent_id = 1;
+            let batch = journal_batch_from_changes(&mut state, HashSet::from([2]), Vec::new());
+            assert_eq!(batch.upserts.len(), 2);
+            assert!(batch
+                .upserts
+                .iter()
+                .all(|item| path_is_in_folder_scope(&item.path, "C:\\scope")));
+        }
+
+        #[test]
+        fn replacement_collection_preserves_other_volumes_and_fallback() {
+            let mut states = [
+                state_with_nodes('C', &[(1, 0, "one.txt", false)]),
+                state_with_nodes('D', &[(1, 0, "two.txt", false)]),
+            ];
+            states[1].nodes.get_mut(&1).unwrap().name = "recovered.txt".to_string();
+            states[1].path_cache.clear();
+            let fallback = [SearchItem {
+                path: "E:\\fallback.txt".into(),
+                modified_unix_secs: 0,
+                kind: SearchItemKind::File,
+            }];
+            let items = collect_scope_items(&SearchScope::AllLocalDrives, &mut states, &fallback);
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| item.path.as_ref())
+                    .collect::<HashSet<_>>(),
+                HashSet::from(["C:\\one.txt", "D:\\recovered.txt", "E:\\fallback.txt"])
+            );
+        }
+
+        #[test]
+        fn journal_resume_requires_the_original_position_to_be_available() {
+            let state = state_with_nodes('C', &[]);
+            let mut journal = USN_JOURNAL_DATA_V0 {
+                UsnJournalID: state.journal_id,
+                FirstUsn: 100,
+                NextUsn: 200,
+                ..Default::default()
+            };
+            assert!(journal_can_resume(&state, &journal));
+            journal.FirstUsn = 101;
+            assert!(!journal_can_resume(&state, &journal));
+            journal.FirstUsn = 0;
+            journal.NextUsn = 99;
+            assert!(!journal_can_resume(&state, &journal));
+            journal.NextUsn = 200;
+            journal.UsnJournalID += 1;
+            assert!(!journal_can_resume(&state, &journal));
+        }
     }
 }
 
