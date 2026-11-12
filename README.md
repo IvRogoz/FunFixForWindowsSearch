@@ -4,6 +4,8 @@ NTFSearch is the GPU-first rebuild of `wizmini-native` using `eframe` with a run
 
 It indexes files and folders, supports live NTFS/USN updates when available, and includes a keyboard-first search panel with GPU and soft-renderer modes.
 
+Read more: [NTFSearch on Substack](https://warped3.substack.com/p/ntfseach?utm_source=publication-search).
+
 ## Run (dev)
 
 ```bash
