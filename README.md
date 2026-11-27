@@ -12,6 +12,26 @@ Download `rustsearch.exe` or the Windows x64 ZIP from the [latest release](https
 
 See the [changelog](CHANGELOG.md) for fixes and release validation.
 
+## Function demos
+
+These GIFs use the actual app renderer with synthetic files, rendered entirely offscreen without desktop or screen capture or OS input. Search and commands use the app's logic. Live updates use simulated USN events; recovery uses isolated journal and drive simulations with illustrative progress timing. No real journal reset or drive disconnection is shown.
+
+### Search — offscreen demo
+
+![Offscreen search demo with synthetic files: plain text, Boolean terms and wildcards](docs/demos/ntfsearch-search.gif)
+
+### Commands — offscreen demo
+
+![Offscreen command demo: slash-command menu, result rows and tracking toggle](docs/demos/ntfsearch-commands.gif)
+
+### Live updates — simulated USN events
+
+![Simulated USN events: file creation, rename, update, deletion and recent-change filtering](docs/demos/ntfsearch-live-updates.gif)
+
+### Recovery — isolated simulation
+
+![Isolated recovery simulation: cached results, continued updates from another drive and journal rebuild](docs/demos/ntfsearch-recovery.gif)
+
 ## Run (dev)
 
 ```bash
