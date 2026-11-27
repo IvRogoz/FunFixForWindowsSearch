@@ -46,7 +46,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState) {
         draw_commands(frame, area, app);
     }
 
-    if app.show_quick_help_overlay {
+    if app.show_quick_help_overlay && !app.show_startup_about {
         draw_overlay(
             frame,
             area,
@@ -60,25 +60,11 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState) {
         );
     }
 
-    if app.show_about_overlay {
-        draw_overlay(
-            frame,
-            area,
-            vec![
-                "NTFSSearch",
-                "made by IvRogoz - 2026",
-                "Rendering: egui native GPU UI (fallback: /soft)",
-                "Indexing: NTFS/USN live when elevated, DIRWALK fallback otherwise",
-                "Hotkey: ` toggles panel | Enter opens | Alt+Enter reveals",
-                "Commands: /all /entire /reindex /up /track /latest /fullscreen /fullheight",
-                "",
-                "Press any key to close",
-            ],
-            Color::Rgb(130, 210, 255),
-        );
+    if app.show_about_overlay || app.show_startup_about {
+        draw_overlay(frame, area, app.about_lines(), Color::Rgb(130, 210, 255));
     }
 
-    if app.show_privilege_overlay {
+    if app.show_privilege_overlay && !app.show_startup_about {
         draw_overlay(
             frame,
             area,

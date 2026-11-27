@@ -60,6 +60,25 @@ const PANEL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const PANEL_SHOWN_Y: f32 = 0.0;
 const PANEL_HIDDEN_Y_EXTRA: f32 = 24.0;
 
+const ABOUT_LINES: &[&str] = &[
+    "██      ██  ██████████  ██████████    ████████                                                  ██        ",
+    "████    ██      ██      ██          ██                                                          ██        ",
+    "██  ██  ██      ██      ██          ██            ██████      ██████    ██  ████      ████████  ██  ████  ",
+    "██    ████      ██      ████████      ██████    ██      ██          ██  ████    ██  ██          ████    ██",
+    "██      ██      ██      ██                  ██  ██████████    ████████  ██          ██          ██      ██",
+    "██      ██      ██      ██                  ██  ██          ██      ██  ██          ██          ██      ██",
+    "██      ██      ██      ██          ████████      ████████    ████████  ██            ████████  ██      ██",
+    "",
+    "NTFSearch",
+    "made by IvRogoz - 2026",
+    "Rendering: egui native GPU UI (fallback: /soft)",
+    "Indexing: NTFS/USN live when elevated, DIRWALK fallback otherwise",
+    "Hotkey: ` toggles panel | Enter opens | Alt+Enter reveals",
+    "Commands: /all /entire /reindex /up /track /latest /fullscreen /fullheight",
+    "",
+    "Press any key to close",
+];
+
 static DEBUG_LOG_FILES: OnceLock<std::sync::Mutex<Vec<std::fs::File>>> = OnceLock::new();
 static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -253,7 +272,7 @@ impl RustSearchEguiApp {
             return;
         }
 
-        if self.runtime.show_quick_help_overlay {
+        if self.runtime.show_quick_help_overlay && !self.runtime.show_startup_about {
             let mut enter_pressed = false;
             let mut close_help_once = false;
             let mut close_help_forever = false;
@@ -291,7 +310,9 @@ impl RustSearchEguiApp {
             return;
         }
 
-        if self.runtime.show_privilege_overlay || self.runtime.show_about_overlay {
+        if (self.runtime.show_privilege_overlay || self.runtime.show_about_overlay)
+            && !self.runtime.show_startup_about
+        {
             let mut dismiss_overlay = false;
 
             ctx.input(|i| {
@@ -357,9 +378,10 @@ impl RustSearchEguiApp {
         if !self.runtime.panel_visible {
             return;
         }
-        if self.runtime.show_privilege_overlay
+        if (self.runtime.show_privilege_overlay
             || self.runtime.show_quick_help_overlay
-            || self.runtime.show_about_overlay
+            || self.runtime.show_about_overlay)
+            && !self.runtime.show_startup_about
         {
             return;
         }
@@ -424,9 +446,10 @@ impl RustSearchEguiApp {
 
 impl RustSearchEguiApp {
     fn apply_panel_input(&mut self, ctx: &egui::Context) {
-        let overlay_active = self.runtime.show_privilege_overlay
+        let overlay_active = (self.runtime.show_privilege_overlay
             || self.runtime.show_quick_help_overlay
-            || self.runtime.show_about_overlay;
+            || self.runtime.show_about_overlay)
+            && !self.runtime.show_startup_about;
         if !overlay_active {
             self.apply_query_text_input(ctx);
         }
@@ -440,6 +463,9 @@ impl RustSearchEguiApp {
 impl eframe::App for RustSearchEguiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = Instant::now();
+        if let Some(remaining) = self.runtime.update_startup_about(now) {
+            ctx.request_repaint_after(remaining);
+        }
         let dt_ms = now
             .saturating_duration_since(self.last_frame_instant)
             .as_secs_f32()
@@ -916,6 +942,33 @@ mod window_height_tests {
         };
         let _ = ctx.run(input, |ctx| app.apply_panel_input(ctx));
         assert_eq!(app.runtime.result_rows, 8);
+    }
+
+    #[test]
+    fn startup_about_does_not_block_commands_or_activate_hidden_help() {
+        for elevated in [false, true] {
+            let mut app = app_without_native_resources();
+            app.runtime.show_startup_about = true;
+            app.runtime.show_privilege_overlay = !elevated;
+            app.runtime.show_quick_help_overlay = elevated;
+            app.runtime.raw_query = "/rows 8".into();
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.apply_panel_input(ctx));
+            assert_eq!(app.runtime.result_rows, 8);
+            assert!(app.runtime.show_startup_about);
+            assert_eq!(app.runtime.show_quick_help_overlay, elevated);
+            assert_eq!(app.runtime.show_privilege_overlay, !elevated);
+        }
     }
 
     #[test]

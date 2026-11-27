@@ -345,11 +345,23 @@ fn draw_command_popup(ctx: &egui::Context, app: &AppState, results_rect: egui::R
 }
 
 fn draw_notice_overlay(ctx: &egui::Context, app: &AppState) {
-    if !app.show_quick_help_overlay && !app.show_privilege_overlay && !app.show_about_overlay {
+    if !app.show_quick_help_overlay
+        && !app.show_privilege_overlay
+        && !app.show_about_overlay
+        && !app.show_startup_about
+    {
         return;
     }
 
-    let (title, color, lines): (&str, egui::Color32, Vec<&str>) = if app.show_privilege_overlay {
+    let showing_about =
+        app.show_startup_about || (app.show_about_overlay && !app.show_privilege_overlay);
+    let (title, color, lines): (&str, egui::Color32, Vec<&str>) = if showing_about {
+        (
+            "About",
+            egui::Color32::from_rgb(130, 210, 255),
+            app.about_lines(),
+        )
+    } else if app.show_privilege_overlay {
         (
             "Notice",
             egui::Color32::from_rgb(230, 80, 80),
@@ -363,21 +375,6 @@ fn draw_notice_overlay(ctx: &egui::Context, app: &AppState) {
                 "NTFS access is unavailable in this mode",
                 "Using DIRWALK fallback (SLOWER)",
                 "Type /up and press Enter to relaunch elevated",
-            ],
-        )
-    } else if app.show_about_overlay {
-        (
-            "About",
-            egui::Color32::from_rgb(130, 210, 255),
-            vec![
-                "NTFSSearch",
-                "made by IvRogoz - 2026",
-                "Rendering: egui native GPU UI (fallback: /soft)",
-                "Indexing: NTFS/USN live when elevated, DIRWALK fallback otherwise",
-                "Hotkey: ` toggles panel | Enter opens | Alt+Enter reveals",
-                "Commands: /all /entire /reindex /up /track /latest /fullscreen /fullheight",
-                "",
-                "Press any key to close",
             ],
         )
     } else {
@@ -398,10 +395,12 @@ fn draw_notice_overlay(ctx: &egui::Context, app: &AppState) {
 
     egui::Area::new(egui::Id::new("notice-overlay"))
         .order(egui::Order::Foreground)
+        .interactable(!app.show_startup_about)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style())
                 .fill(egui::Color32::from_rgb(18, 22, 30))
+                .corner_radius(0)
                 .stroke(egui::Stroke::new(1.0, color))
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
@@ -410,7 +409,21 @@ fn draw_notice_overlay(ctx: &egui::Context, app: &AppState) {
                         ui.label(egui::RichText::new(title).strong().color(color).monospace());
                         ui.add_space(4.0);
 
-                        for line in lines {
+                        let banner_rows = if showing_about {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(lines[..7].join("\n"))
+                                        .color(color)
+                                        .monospace(),
+                                )
+                                .halign(egui::Align::LEFT)
+                                .extend(),
+                            );
+                            7
+                        } else {
+                            0
+                        };
+                        for line in lines.into_iter().skip(banner_rows) {
                             if line == "Type /up and press Enter to relaunch elevated" {
                                 ui.horizontal_centered(|ui| {
                                     ui.label(egui::RichText::new("Type ").color(color).monospace());

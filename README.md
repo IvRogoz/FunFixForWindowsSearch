@@ -1,5 +1,9 @@
 # NTFSearch
 
+![Four-second startup demo: NTFSearch About banner followed by simulated indexing](docs/demos/ntfsearch-startup-4s.gif)
+
+*Four-second offscreen demo: the About banner closes after two seconds while the app keeps working. Loading progress and files are simulated. [Static banner preview](docs/demos/ntfsearch-startup-ascii.png).*
+
 NTFSearch is a standalone, portable Windows file and folder finder built with `eframe`, with a runtime-selectable renderer path.
 
 It indexes files and folders, supports live NTFS/USN updates when available, and includes a keyboard-first search panel with GPU and soft-renderer modes.
@@ -9,6 +13,8 @@ Read more: [NTFSearch on Substack](https://warped3.substack.com/p/ntfseach?utm_s
 ## Download and run
 
 Download `rustsearch.exe` or the Windows x64 ZIP from the [latest release](https://github.com/IvRogoz/FunFixForWindowsSearch/releases/latest). Extract the ZIP, if used, into a writable folder and run `rustsearch.exe`. No installation is required. Keep the executable, its settings and `snapshots/` directory together when moving the app.
+
+The NTFSearch About banner appears for two seconds on the first visible startup frame. Indexing, search and commands keep working during the banner. Open `/about` to view it again until dismissed.
 
 See the [changelog](CHANGELOG.md) for fixes and release validation.
 
@@ -90,7 +96,7 @@ The app stores `scope.txt`, `quick-help-dismissed.txt`, the `snapshots/` directo
 - `/fullheight`: toggle full-height mode
 - `/gpu`: switch to GPU renderer
 - `/soft`: switch to soft renderer
-- `/about`: show app information
+- `/about`: show the NTFSearch ASCII banner and app information until dismissed
 - `/testProgress`: run the progress UI test
 - `/exit`: quit the app
 
@@ -111,3 +117,5 @@ The test creates its own files under `target/live-usn`, verifies file/folder cha
 The regular suite also includes `indexing_ntfs::imp::recovery_simulations`. These in-memory tests run the production recovery loop with mocked device responses and snapshot writes. They cover journal resets, lost history, disconnection/reconnection, failed rebuilds, cancellation, handle cleanup, and continued updates from other drives, without accessing real drives or journals.
 
 For v0.1.12, all 51 regular tests and the separate live-USN test passed. Actual journal reset and physical drive disconnection were not performed; those recovery paths were tested only through simulations.
+
+For v0.1.13, all 54 regular tests passed, including the startup timer and background-work checks. The GPU and soft startup views were rendered and checked offscreen. The separate live-USN test was not rerun for these startup/UI changes.

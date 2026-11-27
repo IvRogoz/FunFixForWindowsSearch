@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.1.13 - 2026-11-27
+
+### Added
+
+- Show the NTFSearch ASCII About banner for two seconds on the first visible startup frame, while indexing, search and commands continue working.
+- Share the About banner and app information between the GPU and soft renderers. Opening `/about` manually keeps it visible until dismissed.
+- Put a four-second offscreen startup GIF and static banner preview at the top of the README, retaining simulated-loading labels.
+
+### Fixed
+
+- Align ASCII banner rows as one multiline block in the GPU renderer.
+- Prevent hidden privilege and Quick Start notices from intercepting commands while the startup banner is visible.
+
+### Verified
+
+- 54 regular tests passed, including startup timing, background index progress, hidden startup, manual About behavior and command handling.
+- Both renderers were checked offscreen with elevated and fallback startup states.
+- The startup GIF was decoded and verified as 30 frames totaling exactly 4,000 ms; the banner occupies its first two seconds.
+- The optimized Windows executable compiled with the existing Rust toolchain and compiled dependencies; dependency versions are unchanged.
+- Rust formatting and Git whitespace checks passed. No desktop or screen access was used.
+- The separate live-USN integration test was not rerun for these startup/UI changes; its last successful run is recorded under v0.1.12.
+
 ## v0.1.12 - 2026-11-27
 
 ### Fixed

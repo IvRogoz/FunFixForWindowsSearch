@@ -72,6 +72,8 @@ pub(crate) struct AppState {
     pub(crate) show_privilege_overlay: bool,
     pub(crate) show_quick_help_overlay: bool,
     pub(crate) show_about_overlay: bool,
+    pub(crate) show_startup_about: bool,
+    startup_about_deadline: Option<Instant>,
     pub(crate) quick_help_selected_action: usize,
     pub(crate) pending_query: Option<(String, Instant, u64)>,
     pub(crate) query_edit_counter: u64,
@@ -156,6 +158,8 @@ impl AppState {
             show_privilege_overlay: !is_elevated,
             show_quick_help_overlay: is_elevated && !load_quick_help_dismissed(),
             show_about_overlay: false,
+            show_startup_about: true,
+            startup_about_deadline: None,
             quick_help_selected_action: 0,
             pending_query: None,
             query_edit_counter: 0,
@@ -184,6 +188,30 @@ impl AppState {
 
         app.begin_index(app.scope.clone());
         app
+    }
+
+    pub(crate) fn update_startup_about(&mut self, now: Instant) -> Option<Duration> {
+        if !self.show_startup_about || !self.panel_visible {
+            return None;
+        }
+        // Start the two seconds on the first visible frame, after initialization.
+        let deadline = *self
+            .startup_about_deadline
+            .get_or_insert(now + Duration::from_secs(2));
+        if now >= deadline {
+            self.show_startup_about = false;
+            return None;
+        }
+        Some(deadline.duration_since(now))
+    }
+
+    pub(crate) fn about_lines(&self) -> Vec<&'static str> {
+        let mut lines = crate::ABOUT_LINES.to_vec();
+        if self.show_startup_about {
+            *lines.last_mut().unwrap() =
+                "Closes after 2 seconds | Indexing continues in the background";
+        }
+        lines
     }
 
     pub(crate) fn on_query_changed(&mut self, query: String) {
@@ -222,7 +250,7 @@ impl AppState {
     }
 
     fn activate_selected_with(&mut self, open: impl FnOnce(&str) -> Result<(), String>) {
-        if self.show_quick_help_overlay {
+        if self.show_quick_help_overlay && !self.show_startup_about {
             if self.quick_help_selected_action == 0 {
                 self.show_quick_help_overlay = false;
             } else {
@@ -255,15 +283,15 @@ impl AppState {
     }
 
     pub(crate) fn on_escape(&mut self) {
-        if self.show_privilege_overlay {
+        if self.show_privilege_overlay && !self.show_startup_about {
             self.show_privilege_overlay = false;
             return;
         }
-        if self.show_about_overlay {
+        if self.show_about_overlay && !self.show_startup_about {
             self.show_about_overlay = false;
             return;
         }
-        if self.show_quick_help_overlay {
+        if self.show_quick_help_overlay && !self.show_startup_about {
             self.show_quick_help_overlay = false;
             return;
         }
@@ -271,7 +299,7 @@ impl AppState {
     }
 
     pub(crate) fn on_move_down(&mut self) {
-        if self.show_quick_help_overlay {
+        if self.show_quick_help_overlay && !self.show_startup_about {
             self.quick_help_selected_action = 1;
             return;
         }
@@ -285,7 +313,7 @@ impl AppState {
     }
 
     pub(crate) fn on_move_up(&mut self) {
-        if self.show_quick_help_overlay {
+        if self.show_quick_help_overlay && !self.show_startup_about {
             self.quick_help_selected_action = 0;
             return;
         }
@@ -344,7 +372,7 @@ impl AppState {
     }
 
     fn reveal_selected_with(&mut self, reveal: impl FnOnce(&str) -> Result<(), String>) {
-        if self.show_quick_help_overlay || !self.results_ready() {
+        if (self.show_quick_help_overlay && !self.show_startup_about) || !self.results_ready() {
             return;
         }
         if let Some(item) = self.items.get(self.selected) {
@@ -1047,6 +1075,8 @@ impl AppState {
                 show_privilege_overlay: false,
                 show_quick_help_overlay: false,
                 show_about_overlay: false,
+                show_startup_about: false,
+                startup_about_deadline: None,
                 quick_help_selected_action: 0,
                 pending_query: None,
                 query_edit_counter: 0,
@@ -1088,6 +1118,94 @@ mod tests {
             modified_unix_secs: UNKNOWN_TS,
             kind: SearchItemKind::File,
         }
+    }
+
+    #[test]
+    fn startup_about_expires_after_two_seconds_while_indexing_continues() {
+        let (mut app, _) = AppState::test_state();
+        app.show_startup_about = true;
+        app.show_privilege_overlay = true;
+        app.active_index_job = Some(1);
+        let start = Instant::now();
+        assert_eq!(
+            app.update_startup_about(start),
+            Some(Duration::from_secs(2))
+        );
+
+        let (tx, rx) = mpsc::channel();
+        app.index_rx = Some(rx);
+        let mut outcome = TickOutcome {
+            visibility_changed: false,
+            focus_search: false,
+            should_quit: false,
+            window_mode_request: None,
+            renderer_mode_request: None,
+        };
+        tx.send(IndexEvent::Progress {
+            job_id: 1,
+            current: 5,
+            total: 10,
+            phase: "index",
+        })
+        .unwrap();
+        app.process_index_events(&mut outcome);
+        assert_eq!(app.indexing_progress, 0.5);
+        assert!(app.indexing_in_progress);
+        assert_eq!(
+            app.update_startup_about(start + Duration::from_millis(1999)),
+            Some(Duration::from_millis(1))
+        );
+        assert!(app.show_startup_about);
+
+        tx.send(IndexEvent::Done {
+            job_id: 1,
+            items: vec![item("indexed-during-splash")],
+            backend: IndexBackend::WalkDir,
+        })
+        .unwrap();
+        app.process_index_events(&mut outcome);
+        assert!(!app.indexing_in_progress);
+        assert_eq!(app.all_items[0].path.as_ref(), "indexed-during-splash");
+        assert!(app.show_startup_about);
+        assert_eq!(
+            app.update_startup_about(start + Duration::from_secs(2)),
+            None
+        );
+        assert!(!app.show_startup_about);
+        assert!(app.show_privilege_overlay);
+
+        app.show_privilege_overlay = false;
+        app.apply_raw_query("/about".into(), true);
+        app.update_startup_about(start + Duration::from_secs(10));
+        assert!(app.show_about_overlay);
+        assert!(!app.show_startup_about);
+    }
+
+    #[test]
+    fn hidden_start_waits_for_first_visible_frame_before_timing_about() {
+        let (mut app, _) = AppState::test_state();
+        app.show_startup_about = true;
+        app.show_quick_help_overlay = true;
+        app.panel_visible = false;
+        let start = Instant::now();
+        assert_eq!(app.update_startup_about(start), None);
+        assert!(app.startup_about_deadline.is_none());
+        app.panel_visible = true;
+        let shown_at = start + Duration::from_secs(10);
+        assert_eq!(
+            app.update_startup_about(shown_at),
+            Some(Duration::from_secs(2))
+        );
+        app.update_startup_about(shown_at + Duration::from_secs(2));
+        assert!(!app.show_startup_about);
+        assert!(app.show_quick_help_overlay);
+        app.panel_visible = false;
+        app.panel_visible = true;
+        assert_eq!(
+            app.update_startup_about(shown_at + Duration::from_secs(3)),
+            None
+        );
+        assert!(!app.show_startup_about);
     }
 
     #[test]
