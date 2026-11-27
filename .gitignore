@@ -1,4 +1,5 @@
 /target/
+/graphify-out/
 *.pdb
 *.ilk
 *.obj

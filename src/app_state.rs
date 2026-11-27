@@ -1,5 +1,8 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::mpsc;
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,6 +44,7 @@ pub(crate) struct AppState {
     pub(crate) raw_query: String,
     pub(crate) query: String,
     pub(crate) all_items: Vec<SearchItem>,
+    item_positions: HashMap<Box<str>, usize>,
     pub(crate) items: Vec<SearchItem>,
     pub(crate) selected: usize,
     pub(crate) last_action: String,
@@ -54,6 +58,7 @@ pub(crate) struct AppState {
     pub(crate) scope: SearchScope,
     pub(crate) command_selected: usize,
     pub(crate) index_rx: Option<mpsc::Receiver<IndexEvent>>,
+    index_cancel: Option<Arc<AtomicBool>>,
     pub(crate) index_job_counter: u64,
     pub(crate) active_index_job: Option<u64>,
     pub(crate) indexing_in_progress: bool,
@@ -123,6 +128,7 @@ impl AppState {
             raw_query: String::new(),
             query: String::new(),
             all_items: Vec::new(),
+            item_positions: HashMap::new(),
             items: Vec::new(),
             selected: 0,
             last_action: "Indexing files...".to_string(),
@@ -136,6 +142,7 @@ impl AppState {
             scope: startup_scope,
             command_selected: 0,
             index_rx: None,
+            index_cancel: None,
             index_job_counter: 0,
             active_index_job: None,
             indexing_in_progress: false,
@@ -193,6 +200,8 @@ impl AppState {
         self.raw_query = query;
         self.query_edit_counter = self.query_edit_counter.wrapping_add(1);
         self.cancel_active_search();
+        self.items.clear();
+        self.selected = 0;
         self.needs_search_refresh = false;
         self.pending_query = Some((
             self.raw_query.clone(),
@@ -209,6 +218,10 @@ impl AppState {
     }
 
     pub(crate) fn activate_selected(&mut self) {
+        self.activate_selected_with(open_path);
+    }
+
+    fn activate_selected_with(&mut self, open: impl FnOnce(&str) -> Result<(), String>) {
         if self.show_quick_help_overlay {
             if self.quick_help_selected_action == 0 {
                 self.show_quick_help_overlay = false;
@@ -234,9 +247,10 @@ impl AppState {
             }
         } else if self.raw_query.trim_start().starts_with('/') {
             self.last_action = format!("Unknown command: {}", first_token);
-        } else if let Some(item) = self.items.get(self.selected) {
-            self.last_action = format!("Open: {}", item.path);
-            let _ = open_path(item.path.as_ref());
+        } else if self.results_ready() {
+            if let Some(item) = self.items.get(self.selected) {
+                self.last_action = path_action_status("Open", &item.path, open(&item.path));
+            }
         }
     }
 
@@ -326,13 +340,22 @@ impl AppState {
     }
 
     pub(crate) fn on_alt_enter(&mut self) {
-        if self.show_quick_help_overlay {
+        self.reveal_selected_with(reveal_path);
+    }
+
+    fn reveal_selected_with(&mut self, reveal: impl FnOnce(&str) -> Result<(), String>) {
+        if self.show_quick_help_overlay || !self.results_ready() {
             return;
         }
         if let Some(item) = self.items.get(self.selected) {
-            self.last_action = format!("Reveal: {}", item.path);
-            let _ = reveal_path(item.path.as_ref());
+            self.last_action = path_action_status("Reveal", &item.path, reveal(&item.path));
         }
+    }
+
+    fn results_ready(&self) -> bool {
+        self.pending_query.is_none()
+            && self.active_search_job.is_none()
+            && !self.needs_search_refresh
     }
 
     fn apply_raw_query(&mut self, raw_query: String, execute_directives: bool) {
@@ -425,6 +448,7 @@ impl AppState {
             self.tracking_enabled = !self.tracking_enabled;
             self.latest_only_mode = false;
             self.recent_event_by_path.clear();
+            let _ = self.search_tx.send(SearchWorkerMessage::ClearRecentEvents);
             if self.tracking_enabled {
                 self.last_action = "Tracking enabled".to_string();
             } else {
@@ -527,6 +551,7 @@ impl AppState {
 
             self.scope = new_scope;
             self.all_items.clear();
+            self.item_positions.clear();
             self.items.clear();
             self.selected = 0;
             self.last_action = format!("Indexing scope: {}", self.scope.label());
@@ -545,9 +570,16 @@ impl AppState {
         self.query.clear();
         self.pending_query = None;
         self.command_selected = 0;
+        if !self.should_exit
+            && self.active_search_job.is_none()
+            && (!self.indexing_in_progress || self.indexing_is_refresh)
+        {
+            self.schedule_search_from_current_query();
+        }
     }
 
     fn begin_index(&mut self, scope: SearchScope) {
+        let cancel = self.replace_index_cancellation();
         self.index_job_counter += 1;
         let job_id = self.index_job_counter;
         self.active_index_job = Some(job_id);
@@ -565,6 +597,8 @@ impl AppState {
         self.index_backend = IndexBackend::Detecting;
         self.index_memory_bytes = 0;
         self.cancel_active_search();
+        self.items.clear();
+        self.selected = 0;
         let _ = self.search_tx.send(SearchWorkerMessage::Clear);
         self.needs_search_refresh = false;
         self.recent_event_by_path.clear();
@@ -576,8 +610,17 @@ impl AppState {
         self.index_rx = Some(rx);
 
         thread::spawn(move || {
-            indexing::run_index_job(scope, job_id, tx);
+            indexing::run_index_job(scope, job_id, tx, cancel);
         });
+    }
+
+    fn replace_index_cancellation(&mut self) -> Arc<AtomicBool> {
+        if let Some(previous) = self.index_cancel.take() {
+            previous.store(true, Ordering::Release);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.index_cancel = Some(Arc::clone(&cancel));
+        cancel
     }
 
     pub(crate) fn process_tick(&mut self) -> TickOutcome {
@@ -652,103 +695,7 @@ impl AppState {
             }
         }
 
-        if let Some(rx) = &self.index_rx {
-            let mut pending = Vec::new();
-            for _ in 0..MAX_INDEX_EVENTS_PER_TICK {
-                match rx.try_recv() {
-                    Ok(event) => pending.push(event),
-                    Err(_) => break,
-                }
-            }
-
-            for event in pending {
-                match event {
-                    IndexEvent::SnapshotLoaded { job_id, items } => {
-                        if self.active_index_job == Some(job_id) {
-                            self.all_items = items;
-                            self.indexing_is_refresh = true;
-                            self.recompute_index_memory_bytes();
-                            self.push_corpus_to_search_worker();
-                            self.schedule_search_from_current_query();
-                            self.last_action = format!(
-                                "Loaded snapshot: {} items [{}]",
-                                self.all_items.len(),
-                                self.scope.label()
-                            );
-                        }
-                    }
-                    IndexEvent::Progress {
-                        job_id,
-                        current,
-                        total,
-                        phase,
-                    } => {
-                        if self.active_index_job == Some(job_id) {
-                            self.indexing_in_progress = true;
-                            self.indexing_phase = phase;
-                            self.indexing_progress = if total == 0 {
-                                0.0
-                            } else {
-                                (current as f32 / total as f32).clamp(0.0, 1.0)
-                            };
-                        }
-                    }
-                    IndexEvent::Done {
-                        job_id,
-                        items,
-                        backend,
-                    } => {
-                        if self.active_index_job == Some(job_id) {
-                            self.indexing_in_progress = false;
-                            self.indexing_progress = 1.0;
-                            self.indexing_phase = "done";
-                            self.index_backend = backend;
-                            self.all_items = items;
-                            self.recompute_index_memory_bytes();
-                            self.recent_event_by_path.clear();
-                            self.changes_added_since_index = 0;
-                            self.changes_updated_since_index = 0;
-                            self.changes_deleted_since_index = 0;
-                            self.push_corpus_to_search_worker();
-                            if self.all_items.is_empty() && backend == IndexBackend::Detecting {
-                                self.last_action = "NTFS indexing unavailable (run elevated and ensure USN journal is available)".to_string();
-                            } else {
-                                self.last_action = format!(
-                                    "Indexed {} files [{}]",
-                                    self.all_items.len(),
-                                    self.scope.label()
-                                );
-                            }
-                            self.schedule_search_from_current_query();
-                            out.focus_search = true;
-                        }
-                    }
-                    IndexEvent::Delta {
-                        job_id,
-                        upserts,
-                        deleted_paths,
-                    } => {
-                        if self.active_index_job == Some(job_id) {
-                            let (added, updated, deleted) =
-                                self.apply_index_delta(upserts, deleted_paths);
-                            self.changes_added_since_index += added;
-                            self.changes_updated_since_index += updated;
-                            self.changes_deleted_since_index += deleted;
-                            self.recompute_index_memory_bytes();
-                            self.push_corpus_to_search_worker();
-                            self.indexing_in_progress = false;
-                            self.indexing_progress = 1.0;
-                            self.indexing_phase = "live";
-                            self.last_action = format!(
-                                "Live index update: {} items [{}]",
-                                self.all_items.len(),
-                                self.scope.label()
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        self.process_index_events(&mut out);
 
         if self._hotkey_manager.is_none() || self._hotkey.is_none() {
             let should_retry = self
@@ -817,6 +764,106 @@ impl AppState {
         out
     }
 
+    fn process_index_events(&mut self, out: &mut TickOutcome) {
+        if let Some(rx) = &self.index_rx {
+            let mut pending = Vec::new();
+            for _ in 0..MAX_INDEX_EVENTS_PER_TICK {
+                match rx.try_recv() {
+                    Ok(event) => pending.push(event),
+                    Err(_) => break,
+                }
+            }
+
+            for event in pending {
+                match event {
+                    IndexEvent::SnapshotLoaded { job_id, items } => {
+                        if self.active_index_job == Some(job_id) {
+                            self.all_items = items;
+                            self.item_positions = crate::corpus::item_positions(&self.all_items);
+                            self.indexing_is_refresh = true;
+                            self.recompute_index_memory_bytes();
+                            self.push_corpus_to_search_worker();
+                            self.schedule_search_from_current_query();
+                            self.last_action = format!(
+                                "Loaded snapshot: {} items [{}]",
+                                self.all_items.len(),
+                                self.scope.label()
+                            );
+                        }
+                    }
+                    IndexEvent::Progress {
+                        job_id,
+                        current,
+                        total,
+                        phase,
+                    } => {
+                        if self.active_index_job == Some(job_id) {
+                            self.indexing_in_progress = true;
+                            self.indexing_phase = phase;
+                            self.indexing_progress = if total == 0 {
+                                0.0
+                            } else {
+                                (current as f32 / total as f32).clamp(0.0, 1.0)
+                            };
+                        }
+                    }
+                    IndexEvent::Done {
+                        job_id,
+                        items,
+                        backend,
+                    } => {
+                        if self.active_index_job == Some(job_id) {
+                            self.indexing_in_progress = false;
+                            self.indexing_progress = 1.0;
+                            self.indexing_phase = "done";
+                            self.index_backend = backend;
+                            self.all_items = items;
+                            self.item_positions = crate::corpus::item_positions(&self.all_items);
+                            self.recompute_index_memory_bytes();
+                            self.recent_event_by_path.clear();
+                            self.changes_added_since_index = 0;
+                            self.changes_updated_since_index = 0;
+                            self.changes_deleted_since_index = 0;
+                            self.push_corpus_to_search_worker();
+                            if self.all_items.is_empty() && backend == IndexBackend::Detecting {
+                                self.last_action = "NTFS indexing unavailable (run elevated and ensure USN journal is available)".to_string();
+                            } else {
+                                self.last_action = format!(
+                                    "Indexed {} files [{}]",
+                                    self.all_items.len(),
+                                    self.scope.label()
+                                );
+                            }
+                            self.schedule_search_from_current_query();
+                            out.focus_search = true;
+                        }
+                    }
+                    IndexEvent::Delta {
+                        job_id,
+                        upserts,
+                        deleted_paths,
+                    } => {
+                        if self.active_index_job == Some(job_id) {
+                            let (added, updated, deleted) =
+                                self.apply_index_delta(upserts, deleted_paths);
+                            self.changes_added_since_index += added;
+                            self.changes_updated_since_index += updated;
+                            self.changes_deleted_since_index += deleted;
+                            self.indexing_in_progress = false;
+                            self.indexing_progress = 1.0;
+                            self.indexing_phase = "live";
+                            self.last_action = format!(
+                                "Live index update: {} items [{}]",
+                                self.all_items.len(),
+                                self.scope.label()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn recompute_index_memory_bytes(&mut self) {
         self.index_memory_bytes = estimate_index_memory_bytes(&self.all_items);
     }
@@ -838,8 +885,15 @@ impl AppState {
     fn schedule_search_from_current_query(&mut self) {
         if !self.panel_visible {
             self.cancel_active_search();
+            self.needs_search_refresh = true;
             return;
         }
+
+        if self.pending_query.is_some() {
+            self.needs_search_refresh = true;
+            return;
+        }
+        self.needs_search_refresh = false;
 
         let q = self.query.trim().to_ascii_lowercase();
 
@@ -860,6 +914,8 @@ impl AppState {
             self.cancel_active_search();
             self.clamp_selected();
         } else {
+            self.items.clear();
+            self.selected = 0;
             self.search_generation = self.search_generation.wrapping_add(1);
             let generation = self.search_generation;
             self.active_search_job = Some(generation);
@@ -892,22 +948,14 @@ impl AppState {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        let mut deleted_count = 0usize;
-        if !deleted_paths.is_empty() {
-            let delete_set: HashSet<String> = deleted_paths.into_iter().collect();
-            if self.tracking_enabled {
-                deleted_count = delete_set.len();
-                for path in &delete_set {
-                    self.recent_event_by_path.remove(path.as_str());
-                }
-            }
-            self.all_items
-                .retain(|item| !delete_set.contains(item.path.as_ref()));
+        let deleted_paths: Vec<Box<str>> = deleted_paths
+            .into_iter()
+            .map(String::into_boxed_str)
+            .collect();
+        for path in &deleted_paths {
+            self.recent_event_by_path.remove(path.as_ref());
         }
-
-        let mut added_count = 0usize;
-        let mut updated_count = 0usize;
-        for upsert in upserts {
+        for upsert in &upserts {
             if self.tracking_enabled {
                 let event_ts = if upsert.modified_unix_secs == UNKNOWN_TS {
                     now_unix
@@ -917,25 +965,255 @@ impl AppState {
                 self.recent_event_by_path
                     .insert(upsert.path.clone(), event_ts);
             }
-            if let Some(existing) = self
-                .all_items
-                .iter_mut()
-                .find(|item| item.path == upsert.path)
-            {
-                *existing = upsert;
-                if self.tracking_enabled {
-                    updated_count += 1;
-                }
-            } else {
-                self.all_items.push(upsert);
-                if self.tracking_enabled {
-                    added_count += 1;
-                }
-            }
         }
 
+        self.cancel_active_search();
+        let _ = self.search_tx.send(SearchWorkerMessage::ApplyDelta {
+            upserts: upserts.clone(),
+            deleted_paths: deleted_paths.clone(),
+            tracking_enabled: self.tracking_enabled,
+            now_unix,
+        });
+        let stats = crate::corpus::apply_delta(
+            &mut self.all_items,
+            &mut self.item_positions,
+            upserts,
+            &deleted_paths,
+        );
+        self.index_memory_bytes = self
+            .index_memory_bytes
+            .saturating_add(stats.bytes_added)
+            .saturating_sub(stats.bytes_removed);
         self.needs_search_refresh = true;
-        (added_count, updated_count, deleted_count)
+        if self.tracking_enabled {
+            (stats.added, stats.updated, stats.deleted)
+        } else {
+            (0, 0, 0)
+        }
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.index_cancel {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn path_action_status(action: &str, path: &str, result: Result<(), String>) -> String {
+    match result {
+        Ok(()) => format!("{action}: {path}"),
+        Err(error) => format!("{action} failed: {path}: {error}"),
+    }
+}
+
+#[cfg(test)]
+impl AppState {
+    // No hotkeys, tray, indexing, filesystem settings, or native windows in tests.
+    pub(crate) fn test_state() -> (Self, mpsc::Receiver<SearchWorkerMessage>) {
+        let (search_tx, requests) = mpsc::channel();
+        let (_, search_rx) = mpsc::channel();
+        (
+            Self {
+                raw_query: String::new(),
+                query: String::new(),
+                all_items: Vec::new(),
+                item_positions: HashMap::new(),
+                items: Vec::new(),
+                selected: 0,
+                last_action: String::new(),
+                panel_visible: true,
+                _hotkey_manager: None,
+                _hotkey: None,
+                _tray_icon: None,
+                menu_toggle_id: None,
+                menu_quit_id: None,
+                last_toggle_at: None,
+                scope: SearchScope::CurrentFolder,
+                command_selected: 0,
+                index_rx: None,
+                index_cancel: None,
+                index_job_counter: 0,
+                active_index_job: None,
+                indexing_in_progress: false,
+                indexing_progress: 0.0,
+                indexing_phase: "index",
+                index_backend: IndexBackend::Detecting,
+                index_memory_bytes: 0,
+                visual_progress_test_active: false,
+                indexing_is_refresh: false,
+                is_elevated: false,
+                show_privilege_overlay: false,
+                show_quick_help_overlay: false,
+                show_about_overlay: false,
+                quick_help_selected_action: 0,
+                pending_query: None,
+                query_edit_counter: 0,
+                search_tx,
+                search_rx,
+                search_generation: 0,
+                active_search_job: None,
+                active_search_query: None,
+                active_search_cursor: 0,
+                needs_search_refresh: false,
+                next_search_refresh_at: Instant::now(),
+                latest_only_mode: false,
+                latest_window_secs: DEFAULT_LATEST_WINDOW_SECS,
+                tracking_enabled: true,
+                result_rows: DEFAULT_RESULT_ROWS,
+                recent_event_by_path: HashMap::new(),
+                changes_added_since_index: 0,
+                changes_updated_since_index: 0,
+                changes_deleted_since_index: 0,
+                hotkey_retry_after: None,
+                skip_scope_persist_once: true,
+                should_exit: false,
+                pending_window_mode_request: None,
+                pending_renderer_mode_request: None,
+            },
+            requests,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SearchItemKind;
+
+    fn item(path: &str) -> SearchItem {
+        SearchItem {
+            path: path.into(),
+            modified_unix_secs: UNKNOWN_TS,
+            kind: SearchItemKind::File,
+        }
+    }
+
+    #[test]
+    fn hidden_completed_reindex_refreshes_existing_results_on_reopen() {
+        let (mut app, _) = AppState::test_state();
+        app.panel_visible = false;
+        app.items = vec![item("old")];
+        app.active_index_job = Some(2);
+        let (tx, rx) = mpsc::channel();
+        app.index_rx = Some(rx);
+        tx.send(IndexEvent::Done {
+            job_id: 2,
+            items: vec![item("new")],
+            backend: IndexBackend::WalkDir,
+        })
+        .unwrap();
+        let mut outcome = TickOutcome {
+            visibility_changed: false,
+            focus_search: false,
+            should_quit: false,
+            window_mode_request: None,
+            renderer_mode_request: None,
+        };
+        app.process_index_events(&mut outcome);
+        assert!(app.needs_search_refresh);
+        assert!(!app.results_ready());
+        app.panel_visible = true;
+        app.schedule_search_from_current_query();
+        assert_eq!(app.items[0].path.as_ref(), "new");
+        assert!(!app.needs_search_refresh);
+    }
+
+    #[test]
+    fn query_edit_and_active_search_cannot_activate_stale_results() {
+        let (mut app, _) = AppState::test_state();
+        app.items = vec![item("old")];
+        app.on_query_changed("new".into());
+        assert!(app.items.is_empty());
+        // Even a retained result cannot bypass the pending-query guard.
+        app.items = vec![item("old")];
+        app.activate_selected_with(|_| panic!("opened during debounce"));
+        app.reveal_selected_with(|_| panic!("revealed during debounce"));
+        app.apply_raw_query("new".into(), false);
+        assert!(app.items.is_empty());
+        assert!(app.active_search_job.is_some());
+        app.items = vec![item("old")];
+        app.activate_selected_with(|_| panic!("opened during search"));
+        app.reveal_selected_with(|_| panic!("revealed during search"));
+    }
+
+    #[test]
+    fn commands_still_execute_during_query_debounce() {
+        let (mut app, _) = AppState::test_state();
+        app.all_items = vec![item("available.txt")];
+        app.on_query_changed("/rows 8".into());
+        app.activate_selected_with(|_| panic!("command opened a result"));
+        assert_eq!(app.result_rows, 8);
+        assert!(matches!(
+            app.pending_window_mode_request,
+            Some(WindowModeRequest::SetResultRows(8))
+        ));
+        assert_eq!(app.items[0].path.as_ref(), "available.txt");
+    }
+
+    #[test]
+    fn failed_open_and_reveal_are_reported_in_status() {
+        let (mut app, _) = AppState::test_state();
+        app.items = vec![item("missing.txt")];
+        app.activate_selected_with(|_| Err("file not found".into()));
+        assert_eq!(app.last_action, "Open failed: missing.txt: file not found");
+        app.reveal_selected_with(|_| Err("Explorer unavailable".into()));
+        assert_eq!(
+            app.last_action,
+            "Reveal failed: missing.txt: Explorer unavailable"
+        );
+        app.activate_selected_with(|_| Ok(()));
+        assert_eq!(app.last_action, "Open: missing.txt");
+    }
+
+    #[test]
+    fn replacing_or_dropping_app_cancels_index_jobs() {
+        let (mut app, _) = AppState::test_state();
+        let first = app.replace_index_cancellation();
+        let second = app.replace_index_cancellation();
+        assert!(first.load(Ordering::Acquire));
+        assert!(!second.load(Ordering::Acquire));
+        drop(app);
+        assert!(second.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn live_delta_sends_only_changes_and_updates_memory_and_counts() {
+        let (mut app, requests) = AppState::test_state();
+        app.all_items = vec![item("a"), item("b"), item("c")];
+        app.item_positions = crate::corpus::item_positions(&app.all_items);
+        app.recompute_index_memory_bytes();
+        assert_eq!(
+            app.apply_index_delta(
+                vec![item("b"), item("new")],
+                vec!["a".into(), "missing".into()]
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            app.index_memory_bytes,
+            estimate_index_memory_bytes(&app.all_items)
+        );
+        let mut deltas = 0;
+        for request in requests.try_iter() {
+            match request {
+                SearchWorkerMessage::ApplyDelta {
+                    upserts,
+                    deleted_paths,
+                    ..
+                } => {
+                    assert_eq!(upserts.len(), 2);
+                    assert_eq!(deleted_paths.len(), 2);
+                    deltas += 1;
+                }
+                SearchWorkerMessage::SetCorpus { .. } => panic!("delta copied entire corpus"),
+                _ => {}
+            }
+        }
+        assert_eq!(deltas, 1);
+        assert!(app.needs_search_refresh);
+        app.activate_selected_with(|_| panic!("activated stale live result"));
     }
 }
 

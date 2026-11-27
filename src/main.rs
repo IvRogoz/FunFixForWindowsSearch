@@ -2,9 +2,12 @@
 
 mod app_state;
 mod commands;
+mod corpus;
 mod gpu_ui;
 mod indexing;
 mod indexing_ntfs;
+#[cfg(all(test, target_os = "windows"))]
+mod live_usn_tests;
 mod platform;
 mod search;
 mod search_worker;
@@ -27,7 +30,11 @@ use soft_ratatui::embedded_graphics_unicodefonts::{
 use soft_ratatui::{EmbeddedGraphics, SoftBackend};
 
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+use windows_sys::Win32::Foundation::RECT;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SystemParametersInfoW, SM_CXSCREEN, SPI_GETWORKAREA,
+};
 
 const VISIBLE_RESULTS_LIMIT: usize = 600;
 const QUERY_DEBOUNCE_DELAY: Duration = Duration::from_millis(70);
@@ -80,7 +87,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "RustSearch",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            let window_height = capped_window_height(DEFAULT_RESULT_ROWS, &cc.egui_ctx);
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    window_width,
+                    window_height,
+                )));
             Ok(Box::new(RustSearchEguiApp::new(
                 start_visible,
                 startup_scope.clone(),
@@ -130,6 +143,19 @@ impl RustSearchEguiApp {
     }
 
     fn apply_window_mode_request(&mut self, ctx: &egui::Context, request: WindowModeRequest) {
+        self.apply_window_mode_with_work_area(
+            ctx,
+            request,
+            work_area_height(ctx.pixels_per_point()),
+        );
+    }
+
+    fn apply_window_mode_with_work_area(
+        &mut self,
+        ctx: &egui::Context,
+        request: WindowModeRequest,
+        work_area: Option<f32>,
+    ) {
         match request {
             WindowModeRequest::ToggleFullscreen => {
                 if !self.fullscreen_enabled {
@@ -140,9 +166,12 @@ impl RustSearchEguiApp {
                     self.fullscreen_enabled = false;
                     self.fullheight_enabled = self.fullheight_before_fullscreen;
                     self.window_height = if self.fullheight_enabled {
-                        screen_height()
+                        work_area.unwrap_or(WINDOW_HEIGHT)
                     } else {
-                        WINDOW_HEIGHT
+                        limit_height_to_work_area(
+                            window_height_for_rows(self.runtime.result_rows),
+                            work_area,
+                        )
                     };
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
@@ -159,9 +188,12 @@ impl RustSearchEguiApp {
 
                 self.fullheight_enabled = !self.fullheight_enabled;
                 self.window_height = if self.fullheight_enabled {
-                    screen_height()
+                    work_area.unwrap_or(WINDOW_HEIGHT)
                 } else {
-                    WINDOW_HEIGHT
+                    limit_height_to_work_area(
+                        window_height_for_rows(self.runtime.result_rows),
+                        work_area,
+                    )
                 };
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     self.window_width,
@@ -174,7 +206,8 @@ impl RustSearchEguiApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                 }
                 self.fullheight_enabled = false;
-                self.window_height = window_height_for_rows(rows);
+                self.window_height =
+                    limit_height_to_work_area(window_height_for_rows(rows), work_area);
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     self.window_width,
                     self.window_height,
@@ -389,6 +422,21 @@ impl RustSearchEguiApp {
     }
 }
 
+impl RustSearchEguiApp {
+    fn apply_panel_input(&mut self, ctx: &egui::Context) {
+        let overlay_active = self.runtime.show_privilege_overlay
+            || self.runtime.show_quick_help_overlay
+            || self.runtime.show_about_overlay;
+        if !overlay_active {
+            self.apply_query_text_input(ctx);
+        }
+        self.apply_hotkeys(ctx);
+        if overlay_active && !self.runtime.should_exit {
+            self.apply_query_text_input(ctx);
+        }
+    }
+}
+
 impl eframe::App for RustSearchEguiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = Instant::now();
@@ -433,12 +481,11 @@ impl eframe::App for RustSearchEguiApp {
             return;
         }
 
-        self.apply_hotkeys(ctx);
+        self.apply_panel_input(ctx);
         if self.runtime.should_exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        self.apply_query_text_input(ctx);
 
         egui::CentralPanel::default()
             .frame(
@@ -532,21 +579,42 @@ fn default_window_width() -> f32 {
     WINDOW_WIDTH
 }
 
-fn screen_height() -> f32 {
+fn work_area_height(pixels_per_point: f32) -> Option<f32> {
     #[cfg(target_os = "windows")]
     {
-        let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-        if screen_h > 0 {
-            return screen_h as f32;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let ok = unsafe {
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut rect as *mut RECT as *mut _, 0)
+        };
+        if ok != 0 && rect.bottom > rect.top && pixels_per_point > 0.0 {
+            return Some((rect.bottom - rect.top) as f32 / pixels_per_point);
         }
     }
-
-    WINDOW_HEIGHT
+    let _ = pixels_per_point;
+    None
 }
 
 fn window_height_for_rows(rows: usize) -> f32 {
     let rows = rows.clamp(MIN_RESULT_ROWS, MAX_RESULT_ROWS);
-    (rows as f32 * RESULT_ROW_HEIGHT + WINDOW_NON_RESULT_HEIGHT).max(WINDOW_HEIGHT)
+    rows as f32 * RESULT_ROW_HEIGHT + WINDOW_NON_RESULT_HEIGHT
+}
+
+fn limit_height_to_work_area(height: f32, work_area: Option<f32>) -> f32 {
+    work_area
+        .filter(|height| *height > 0.0)
+        .map_or(height, |limit| height.min(limit))
+}
+
+fn capped_window_height(rows: usize, ctx: &egui::Context) -> f32 {
+    limit_height_to_work_area(
+        window_height_for_rows(rows),
+        work_area_height(ctx.pixels_per_point()),
+    )
 }
 
 fn centered_window_x(window_width: f32) -> f32 {
@@ -768,12 +836,103 @@ impl SearchScope {
 }
 
 pub(crate) fn estimate_index_memory_bytes(items: &[SearchItem]) -> usize {
-    let mut total = std::mem::size_of_val(items);
-    for item in items {
-        total += std::mem::size_of::<SearchItem>();
-        total += item.path.len();
+    items.iter().map(crate::corpus::item_memory_bytes).sum()
+}
+
+#[cfg(test)]
+mod window_height_tests {
+    use super::*;
+
+    fn app_without_native_resources() -> RustSearchEguiApp {
+        let (runtime, _) = AppState::test_state();
+        RustSearchEguiApp {
+            runtime,
+            renderer: Renderer::GpuEgui,
+            panel_progress: 1.0,
+            panel_anim_last_tick: None,
+            window_width: WINDOW_WIDTH,
+            window_height: WINDOW_HEIGHT,
+            fullscreen_enabled: false,
+            fullheight_enabled: false,
+            fullheight_before_fullscreen: false,
+            last_frame_instant: Instant::now(),
+            frame_time_ema_ms: 0.0,
+        }
     }
-    total
+
+    #[test]
+    fn selected_rows_survive_fullheight_and_fullscreen_roundtrips() {
+        let mut app = app_without_native_resources();
+        let ctx = egui::Context::default();
+        app.runtime.result_rows = 8;
+        app.apply_window_mode_with_work_area(
+            &ctx,
+            WindowModeRequest::ToggleFullHeight,
+            Some(720.0),
+        );
+        assert_eq!(app.window_height, 720.0);
+        app.apply_window_mode_with_work_area(
+            &ctx,
+            WindowModeRequest::ToggleFullHeight,
+            Some(720.0),
+        );
+        assert_eq!(app.window_height, 296.0);
+        app.apply_window_mode_with_work_area(
+            &ctx,
+            WindowModeRequest::ToggleFullscreen,
+            Some(720.0),
+        );
+        app.apply_window_mode_with_work_area(
+            &ctx,
+            WindowModeRequest::ToggleFullscreen,
+            Some(720.0),
+        );
+        assert_eq!(app.window_height, 296.0);
+        app.runtime.result_rows = 80;
+        app.apply_window_mode_with_work_area(
+            &ctx,
+            WindowModeRequest::SetResultRows(80),
+            Some(720.0),
+        );
+        assert_eq!(app.window_height, 720.0);
+    }
+
+    #[test]
+    fn text_and_enter_in_same_frame_execute_the_new_query() {
+        let mut app = app_without_native_resources();
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::Text("/rows 8".into()),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.apply_panel_input(ctx));
+        assert_eq!(app.runtime.result_rows, 8);
+    }
+
+    #[test]
+    fn rows_control_height_and_work_area_limits_it() {
+        assert_eq!(window_height_for_rows(8), 296.0);
+        assert_eq!(window_height_for_rows(21), 556.0);
+        assert_eq!(window_height_for_rows(0), window_height_for_rows(8));
+        assert_eq!(window_height_for_rows(100), window_height_for_rows(80));
+        assert_eq!(
+            limit_height_to_work_area(window_height_for_rows(80), Some(720.0)),
+            720.0
+        );
+        assert_eq!(
+            limit_height_to_work_area(window_height_for_rows(8), Some(720.0)),
+            296.0
+        );
+    }
 }
 
 pub(crate) fn format_bytes(bytes: usize) -> String {

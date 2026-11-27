@@ -22,6 +22,13 @@ pub(crate) enum SearchWorkerMessage {
         items: Vec<SearchItem>,
         recent_event_by_path: HashMap<Box<str>, i64>,
     },
+    ApplyDelta {
+        upserts: Vec<SearchItem>,
+        deleted_paths: Vec<Box<str>>,
+        tracking_enabled: bool,
+        now_unix: i64,
+    },
+    ClearRecentEvents,
     Run {
         generation: u64,
         query: String,
@@ -48,6 +55,7 @@ pub(crate) fn spawn_search_worker() -> (
 
     thread::spawn(move || {
         let mut corpus: Vec<SearchItem> = Vec::new();
+        let mut positions = HashMap::new();
         let mut recent_event_by_path: HashMap<Box<str>, i64> = HashMap::new();
         let mut pending_run: Option<SearchRun> = None;
 
@@ -56,6 +64,7 @@ pub(crate) fn spawn_search_worker() -> (
                 if run_search_query(
                     run,
                     &mut corpus,
+                    &mut positions,
                     &mut recent_event_by_path,
                     &request_rx,
                     &event_tx,
@@ -72,8 +81,26 @@ pub(crate) fn spawn_search_worker() -> (
                     recent_event_by_path: recent,
                 }) => {
                     corpus = items;
+                    positions = crate::corpus::item_positions(&corpus);
                     recent_event_by_path = recent;
                 }
+                Ok(SearchWorkerMessage::ApplyDelta {
+                    upserts,
+                    deleted_paths,
+                    tracking_enabled,
+                    now_unix,
+                }) => {
+                    apply_worker_delta(
+                        &mut corpus,
+                        &mut positions,
+                        &mut recent_event_by_path,
+                        upserts,
+                        &deleted_paths,
+                        tracking_enabled,
+                        now_unix,
+                    );
+                }
+                Ok(SearchWorkerMessage::ClearRecentEvents) => recent_event_by_path.clear(),
                 Ok(SearchWorkerMessage::Run {
                     generation,
                     query,
@@ -89,6 +116,7 @@ pub(crate) fn spawn_search_worker() -> (
                 }
                 Ok(SearchWorkerMessage::Clear) => {
                     corpus.clear();
+                    positions.clear();
                     recent_event_by_path.clear();
                     pending_run = None;
                 }
@@ -106,6 +134,7 @@ pub(crate) fn spawn_search_worker() -> (
 fn run_search_query(
     run: SearchRun,
     corpus: &mut Vec<SearchItem>,
+    positions: &mut HashMap<Box<str>, usize>,
     recent_event_by_path: &mut HashMap<Box<str>, i64>,
     request_rx: &mpsc::Receiver<SearchWorkerMessage>,
     event_tx: &mpsc::Sender<SearchEvent>,
@@ -134,7 +163,29 @@ fn run_search_query(
                     recent_event_by_path: recent,
                 } => {
                     *corpus = items;
+                    *positions = crate::corpus::item_positions(corpus);
                     *recent_event_by_path = recent;
+                    return false;
+                }
+                SearchWorkerMessage::ApplyDelta {
+                    upserts,
+                    deleted_paths,
+                    tracking_enabled,
+                    now_unix,
+                } => {
+                    apply_worker_delta(
+                        corpus,
+                        positions,
+                        recent_event_by_path,
+                        upserts,
+                        &deleted_paths,
+                        tracking_enabled,
+                        now_unix,
+                    );
+                    return false;
+                }
+                SearchWorkerMessage::ClearRecentEvents => {
+                    recent_event_by_path.clear();
                     return false;
                 }
                 SearchWorkerMessage::Run {
@@ -151,7 +202,14 @@ fn run_search_query(
                     });
                     return false;
                 }
-                SearchWorkerMessage::Clear | SearchWorkerMessage::Cancel => {
+                SearchWorkerMessage::Clear => {
+                    corpus.clear();
+                    positions.clear();
+                    recent_event_by_path.clear();
+                    *pending_run = None;
+                    return false;
+                }
+                SearchWorkerMessage::Cancel => {
                     *pending_run = None;
                     return false;
                 }
@@ -214,6 +272,32 @@ fn run_search_query(
     false
 }
 
+fn apply_worker_delta(
+    corpus: &mut Vec<SearchItem>,
+    positions: &mut HashMap<Box<str>, usize>,
+    recent: &mut HashMap<Box<str>, i64>,
+    upserts: Vec<SearchItem>,
+    deleted_paths: &[Box<str>],
+    tracking_enabled: bool,
+    now_unix: i64,
+) {
+    for path in deleted_paths {
+        recent.remove(path.as_ref());
+    }
+    if tracking_enabled {
+        for item in &upserts {
+            recent.insert(
+                item.path.clone(),
+                if item.modified_unix_secs == UNKNOWN_TS {
+                    now_unix
+                } else {
+                    item.modified_unix_secs
+                },
+            );
+        }
+    }
+    crate::corpus::apply_delta(corpus, positions, upserts, deleted_paths);
+}
 fn latest_timestamp(
     item: &SearchItem,
     recent_event_by_path: &HashMap<Box<str>, i64>,
@@ -229,6 +313,104 @@ mod tests {
     use super::*;
     use crate::SearchItemKind;
 
+    #[test]
+    fn worker_applies_deltas_and_tracks_recent_events() {
+        let (tx, rx) = spawn_search_worker();
+        let item = |path: &str, ts| SearchItem {
+            path: path.into(),
+            modified_unix_secs: ts,
+            kind: SearchItemKind::File,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        tx.send(SearchWorkerMessage::SetCorpus {
+            items: vec![item("a", 0), item("b", 0), item("c", 0)],
+            recent_event_by_path: HashMap::new(),
+        })
+        .unwrap();
+        tx.send(SearchWorkerMessage::ApplyDelta {
+            upserts: vec![item("c", UNKNOWN_TS), item("d", UNKNOWN_TS)],
+            deleted_paths: vec!["a".into()],
+            tracking_enabled: true,
+            now_unix: now,
+        })
+        .unwrap();
+        tx.send(SearchWorkerMessage::ApplyDelta {
+            upserts: vec![item("c", UNKNOWN_TS)],
+            deleted_paths: vec!["b".into()],
+            tracking_enabled: true,
+            now_unix: now,
+        })
+        .unwrap();
+        tx.send(SearchWorkerMessage::Run {
+            generation: 1,
+            query: String::new(),
+            latest_only_mode: true,
+            latest_window_secs: 60,
+        })
+        .unwrap();
+        let items = loop {
+            if let SearchEvent::Done {
+                generation: 1,
+                items,
+            } = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+            {
+                break items;
+            }
+        };
+        let mut paths: Vec<_> = items.iter().map(|item| item.path.as_ref()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["c", "d"]);
+        tx.send(SearchWorkerMessage::ClearRecentEvents).unwrap();
+        tx.send(SearchWorkerMessage::Run {
+            generation: 2,
+            query: String::new(),
+            latest_only_mode: true,
+            latest_window_secs: 60,
+        })
+        .unwrap();
+        let items = loop {
+            if let SearchEvent::Done {
+                generation: 2,
+                items,
+            } = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+            {
+                break items;
+            }
+        };
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn clear_during_search_clears_all_worker_state() {
+        let mut corpus = vec![SearchItem {
+            path: "a".into(),
+            modified_unix_secs: 0,
+            kind: SearchItemKind::File,
+        }];
+        let mut positions = crate::corpus::item_positions(&corpus);
+        let mut recent = HashMap::from([("a".into(), 1)]);
+        let (tx, rx) = mpsc::channel();
+        let (event_tx, _) = mpsc::channel();
+        tx.send(SearchWorkerMessage::Clear).unwrap();
+        run_search_query(
+            SearchRun {
+                generation: 1,
+                query: String::new(),
+                latest_only_mode: false,
+                latest_window_secs: 0,
+            },
+            &mut corpus,
+            &mut positions,
+            &mut recent,
+            &rx,
+            &event_tx,
+            &mut None,
+        );
+        assert!(corpus.is_empty() && positions.is_empty() && recent.is_empty());
+    }
     #[test]
     fn searches_substrings_and_paths_for_plain_and_boolean_queries() {
         let mut corpus: Vec<SearchItem> = [
@@ -255,6 +437,7 @@ mod tests {
                     latest_window_secs: 0,
                 },
                 &mut corpus,
+                &mut HashMap::new(),
                 &mut HashMap::new(),
                 &request_rx,
                 &event_tx,
@@ -296,6 +479,7 @@ mod tests {
                 latest_window_secs: count as i64 + 60,
             },
             &mut corpus,
+            &mut HashMap::new(),
             &mut HashMap::new(),
             &request_rx,
             &event_tx,

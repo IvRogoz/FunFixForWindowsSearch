@@ -1,4 +1,10 @@
-use std::{env, sync::mpsc};
+use std::{
+    env,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+};
 
 use walkdir::WalkDir;
 
@@ -8,16 +14,29 @@ use crate::{
     debug_log, IndexBackend, IndexEvent, SearchItem, SearchItemKind, SearchScope, UNKNOWN_TS,
 };
 
-pub(crate) fn run_index_job(scope: SearchScope, job_id: u64, tx: mpsc::Sender<IndexEvent>) {
+pub(crate) fn run_index_job(
+    scope: SearchScope,
+    job_id: u64,
+    tx: mpsc::Sender<IndexEvent>,
+    cancel: Arc<AtomicBool>,
+) {
     debug_log(&format!(
         "run_index_job start job_id={} scope={}",
         job_id,
         scope.label()
     ));
 
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let roots = scope_roots(&scope);
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+
     #[cfg(target_os = "windows")]
     {
-        if run_ntfs_live_index_job(scope.clone(), job_id, &tx) {
+        if run_ntfs_live_index_job(scope.clone(), &roots, job_id, &tx, &cancel) {
             debug_log(&format!(
                 "run_index_job live index active job_id={} scope={}",
                 job_id,
@@ -40,12 +59,25 @@ pub(crate) fn run_index_job(scope: SearchScope, job_id: u64, tx: mpsc::Sender<In
         phase: "snapshot",
     });
 
-    if let Some(items) = load_scope_snapshot(&scope) {
+    if let Some(items) = load_scope_snapshot(&scope, &roots) {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let _ = tx.send(IndexEvent::SnapshotLoaded { job_id, items });
     }
 
-    let (items, backend) = index_files_for_scope_with_progress(scope.clone(), job_id, &tx);
-    persist_scope_snapshot_async(scope.clone(), items.clone());
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let (items, backend) =
+        index_files_for_scope_with_progress(scope.clone(), &roots, job_id, &tx, &cancel);
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    persist_scope_snapshot_async(scope.clone(), roots, items.clone(), cancel.clone());
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
     debug_log(&format!(
         "run_index_job finished job_id={} items={} backend= {}",
         job_id,
@@ -61,19 +93,23 @@ pub(crate) fn run_index_job(scope: SearchScope, job_id: u64, tx: mpsc::Sender<In
 
 fn index_files_for_scope_with_progress(
     scope: SearchScope,
+    roots: &[String],
     job_id: u64,
     tx: &mpsc::Sender<IndexEvent>,
+    cancel: &AtomicBool,
 ) -> (Vec<SearchItem>, IndexBackend) {
-    let roots = scope_roots(&scope);
     let mut out = Vec::new();
     let mut scanned = 0usize;
     let mut used_ntfs = false;
     let mut used_walkdir = false;
 
     for root in roots {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let Some(drive_letter) = drive_letter_from_root_str(&root) else {
             used_walkdir = true;
-            let items = walk_root_with_progress(&root, job_id, tx);
+            let items = walk_root_with_progress(root, job_id, tx, cancel);
             scanned += items.len();
             out.extend(items);
             continue;
@@ -81,7 +117,7 @@ fn index_files_for_scope_with_progress(
 
         let volume_root = format!("{}:\\", drive_letter);
 
-        if let Some(mut ntfs_items) = try_index_ntfs_volume(&volume_root, job_id, tx) {
+        if let Some(mut ntfs_items) = try_index_ntfs_volume(&volume_root, job_id, tx, cancel) {
             used_ntfs = true;
 
             if matches!(scope, SearchScope::CurrentFolder) {
@@ -95,8 +131,11 @@ fn index_files_for_scope_with_progress(
             continue;
         }
 
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         used_walkdir = true;
-        let items = walk_root_with_progress(&root, job_id, tx);
+        let items = walk_root_with_progress(root, job_id, tx, cancel);
         scanned += items.len();
         out.extend(items);
     }
@@ -123,6 +162,7 @@ pub(crate) fn walk_root_with_progress(
     root: &str,
     job_id: u64,
     tx: &mpsc::Sender<IndexEvent>,
+    cancel: &AtomicBool,
 ) -> Vec<SearchItem> {
     let mut items = Vec::new();
     for entry in WalkDir::new(root)
@@ -130,6 +170,9 @@ pub(crate) fn walk_root_with_progress(
         .into_iter()
         .filter_map(Result::ok)
     {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if !entry.file_type().is_file() && !entry.file_type().is_dir() {
             continue;
         }
@@ -236,6 +279,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancelled_job_emits_no_events() {
+        let (tx, rx) = mpsc::channel();
+        run_index_job(
+            SearchScope::CurrentFolder,
+            1,
+            tx,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancelled_walk_returns_no_items() {
+        let (tx, rx) = mpsc::channel();
+        let items = walk_root_with_progress(".", 1, &tx, &AtomicBool::new(true));
+        assert!(items.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn directory_fallback_includes_files_and_folders() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -250,7 +313,8 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(&file, "test").unwrap();
         let (tx, _rx) = mpsc::channel();
-        let items = walk_root_with_progress(root.to_str().unwrap(), 1, &tx);
+        let items =
+            walk_root_with_progress(root.to_str().unwrap(), 1, &tx, &AtomicBool::new(false));
         assert!(items
             .iter()
             .any(|item| item.path.as_ref() == file.to_str().unwrap()
