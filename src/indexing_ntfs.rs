@@ -4,13 +4,13 @@ mod imp {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use std::sync::mpsc;
+    use std::thread;
     use std::time::{Duration, Instant};
-    use std::{env, thread};
 
     use serde::{Deserialize, Serialize};
 
     use crate::indexing::{scope_roots, walk_root_with_progress};
-    use crate::storage::persist_scope_snapshot_async;
+    use crate::storage::{app_dir, persist_scope_snapshot_async};
     use crate::{
         debug_log, IndexBackend, IndexEvent, SearchItem, SearchItemKind, SearchScope, UNKNOWN_TS,
     };
@@ -832,10 +832,7 @@ mod imp {
     }
 
     fn checkpoint_file_path() -> std::path::PathBuf {
-        let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-        std::path::PathBuf::from(base)
-            .join("WizMini")
-            .join("usn_checkpoints.txt")
+        app_dir().join("usn_checkpoints.txt")
     }
 
     fn persist_usn_checkpoint(drive: char, journal_id: u64, next_usn: i64) {
@@ -889,9 +886,7 @@ mod imp {
     }
 
     fn snapshot_file_path(drive: char) -> std::path::PathBuf {
-        let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-        std::path::PathBuf::from(base)
-            .join("WizMini")
+        app_dir()
             .join("snapshots")
             .join(format!("{}.bin", drive.to_ascii_uppercase()))
     }

@@ -57,7 +57,7 @@ static DEBUG_LOG_FILES: OnceLock<std::sync::Mutex<Vec<std::fs::File>>> = OnceLoc
 static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn main() -> eframe::Result {
-    let _ = DEBUG_ENABLED.set(env::var("WIZMINI_DEBUG").ok().as_deref() == Some("1"));
+    let _ = DEBUG_ENABLED.set(env::args().any(|arg| arg == "--debug"));
     let _ = init_debug_log_file();
     std::panic::set_hook(Box::new(|info| {
         debug_log(&format!("panic: {}", info));
@@ -112,7 +112,7 @@ impl RustSearchEguiApp {
         window_width: f32,
         window_height: f32,
     ) -> Self {
-        let renderer = Renderer::from_env();
+        let renderer = Renderer::from_args();
 
         Self {
             runtime: AppState::new(start_visible, startup_scope),
@@ -468,10 +468,10 @@ enum Renderer {
 }
 
 impl Renderer {
-    fn from_env() -> Self {
-        let mode = env::var("RUSTSEARCH_RENDERER")
-            .unwrap_or_else(|_| "gpu".to_string())
-            .to_ascii_lowercase();
+    fn from_args() -> Self {
+        let mode = env::args()
+            .find_map(|arg| arg.strip_prefix("--renderer=").map(str::to_ascii_lowercase))
+            .unwrap_or_else(|| "gpu".to_string());
 
         if mode == "soft" || mode == "ratatui" {
             Self::from_mode(RendererModeRequest::Soft)
@@ -587,26 +587,19 @@ fn startup_scope_override_from_args() -> Option<SearchScope> {
     None
 }
 
-fn debug_log_path_localappdata() -> std::path::PathBuf {
-    let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(base)
-        .join("WizMini")
-        .join("rustsearch-debug.log")
-}
-
 fn debug_log_path_exe_dir() -> std::path::PathBuf {
-    let exe_dir = env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|v| v.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    exe_dir.join("rustsearch-debug.log")
+    storage::app_dir().join("rustsearch-debug.log")
 }
 
 fn init_debug_log_file() -> Result<(), String> {
+    if !*DEBUG_ENABLED.get_or_init(|| false) {
+        return Ok(());
+    }
+
     let mut files = Vec::new();
     let mut opened_paths = Vec::new();
 
-    for path in [debug_log_path_localappdata(), debug_log_path_exe_dir()] {
+    for path in [debug_log_path_exe_dir()] {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

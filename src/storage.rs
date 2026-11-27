@@ -138,24 +138,44 @@ fn default_snapshot_kind() -> SnapshotItemKind {
     SnapshotItemKind::File
 }
 
+pub(crate) fn app_dir() -> std::path::PathBuf {
+    let mut path = env::current_exe().expect("Cannot locate the portable application directory");
+    path.pop();
+    path
+}
+
 fn scope_config_path() -> std::path::PathBuf {
-    let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(base)
-        .join("WizMini")
-        .join("scope.txt")
+    app_dir().join("scope.txt")
 }
 
 fn quick_help_config_path() -> std::path::PathBuf {
-    let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(base)
-        .join("WizMini")
-        .join("quick-help-dismissed.txt")
+    app_dir().join("quick-help-dismissed.txt")
 }
 
 fn scope_snapshot_path(scope: &SearchScope) -> std::path::PathBuf {
-    let base = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(base)
-        .join("WizMini")
+    app_dir()
         .join("snapshots")
         .join(format!("scope-{}.bin", scope.label()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_data_stays_beside_the_executable() {
+        let exe = std::env::current_exe().unwrap();
+        let directory = exe.parent().unwrap();
+        assert_eq!(scope_config_path(), directory.join("scope.txt"));
+        assert_eq!(
+            quick_help_config_path(),
+            directory.join("quick-help-dismissed.txt")
+        );
+        assert_eq!(
+            scope_snapshot_path(&SearchScope::AllLocalDrives),
+            directory
+                .join("snapshots")
+                .join("scope-all-local-drives.bin")
+        );
+    }
 }

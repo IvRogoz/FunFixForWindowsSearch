@@ -1,6 +1,6 @@
 # NTFSearch
 
-NTFSearch is the GPU-first rebuild of `wizmini-native` using `eframe` with a runtime-selectable renderer path.
+NTFSearch is a standalone, portable Windows file and folder finder built with `eframe`, with a runtime-selectable renderer path.
 
 It indexes files and folders, supports live NTFS/USN updates when available, and includes a keyboard-first search panel with GPU and soft-renderer modes.
 
@@ -9,19 +9,23 @@ Read more: [NTFSearch on Substack](https://warped3.substack.com/p/ntfseach?utm_s
 ## Run (dev)
 
 ```bash
-cargo run --manifest-path RustSearch/Cargo.toml
+cargo run
 ```
 
 Renderer mode (optional):
 
 - Default: GPU-native egui renderer
-- Legacy soft ratatui renderer: set `RUSTSEARCH_RENDERER=soft`
+- Legacy soft ratatui renderer: run `cargo run -- --renderer=soft` or `rustsearch.exe --renderer=soft`
 
 ## Build (release)
 
 ```bash
-cargo build --release --manifest-path RustSearch/Cargo.toml
+cargo build --release
 ```
+
+The release executable is `target/release/rustsearch.exe`. Copy it into a folder to use the app portably.
+
+The app stores `scope.txt`, `quick-help-dismissed.txt`, `usn_checkpoints.txt`, the `snapshots/` directory, and (when enabled) `rustsearch-debug.log` beside `rustsearch.exe`. Keep these files and the executable together when moving the app. Run `rustsearch.exe --debug` to enable debug logging. No system environment variables are needed.
 
 ## Controls
 
